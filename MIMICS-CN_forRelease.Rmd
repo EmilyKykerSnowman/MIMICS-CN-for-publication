@@ -1,0 +1,2390 @@
+---
+title: "MIMICS-CN applied at LIDET sites"
+output: html_notebook
+---
+
+Original MIMICS model: Wieder, W. R., Grandy, A. S., Kallenbach, C. M. and Bonan, G. B.: Integrating microbial physiology and physio-chemical principles in soils with the MIcrobial-MIneral Carbon Stabilization (MIMICS) model, Biogeosciences, 11(14), 3899–3917, doi:10.5194/bg-11-3899-2014, 2014.
+
+See also: Wieder, W. R., Grandy, A. S., Kallenbach, C. M., Taylor, P. G. and Bonan, G. B.: Representing life in the Earth system with soil microbial functional traits in the MIMICS model, Geosci. Model Dev., 8(6), 2011–2052, doi:10.5194/gmd-8-1789-2015, 2015.
+
+This version: created in an R notebook on April 25th, 2018 by Emily Kyker-Snowman
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+This code requires the following additional files to run correctly:
+LTER_SITE_1.csv
+LIDET_SITE_obs/Archive folder
+DAYCENT_LIDET_all_trimmed.csv
+histogramDataRedone.csv
+
+# A. Basic workspace setup
+
+The working directory is automatically set to wherever the .Rmd notebook file is stored
+
+
+## Clearing variables and loading relevant libraries:
+```{r}
+remove(list=ls())
+library(rootSolve) #stode
+library(hydroGOF) #NSE
+library(ggplot2) #histogram plots
+library(reshape2) #melt
+library(scales) #trans_breaks, pretty colors for figures
+library(gridExtra) #multi-panel ggplot figure
+library(grid) #multi-panel ggplot figure
+library(cowplot) #multi-panel ggplot figure
+citation()
+```
+
+
+## Feature switches
+The true/false statements in this section will turn on and off certain functions so the model can be run more rapidly for simpler outputs (like steady-state site values). 
+```{r}
+experiments=TRUE        #Controls whether or not litterbag additions are simulated
+perturbUnderlying=TRUE  #If TRUE, the underlying model is perturbed with the same inputs as the litterbag 
+                          #tier at the start of the LIDET simulation
+diffNotTrace=TRUE       #If this is true, the litterbags are simulated by adding litter to the underlying model and 
+                          #taking the difference between this and steady-state pool values, rather than using
+                          #the tracer tier.
+spinupYears=5           #At this point, LIDET runs are initiallized with STODE-solved equilibrium values, so all 
+                          #this does is define how many lead years show up on perturbation figures
+SSPlots=FALSE           #If TRUE, shows plots of pools vs time (helpful for assessing steady state and other things)
+stackedExpFigs=FALSE    #If TRUE, creates stacked multicolored figures of the litterbag experiments showing
+                          #how each pool differs from equilibrium over time
+```
+
+
+## Forward underlying model function
+This is the fundamental model function with forward Michaelis-Menten kinetics and density-dependent microbial turnover:
+```{r}
+FXEQ <- function(t, y, pars) {
+  with (as.list(c(y, pars)),{
+    
+    #Carbon fluxes
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #Flows to and from MIC_1
+    LITmin[1] = MIC_1 * VMAX[1] * LIT_1 / (KM[1] + LIT_1)#LIT_1)   #MIC_1 decomp of MET lit
+    LITmin[2] = MIC_1 * VMAX[2] * LIT_2 / (KM[2] + LIT_2)#LIT_2)   #MIC_1 decomp of STRUC lit
+    SOMmin[1] = MIC_1 * VMAX[3] * SOM_3 / (KM[3] + SOM_3)#SOM_3)   #decomp of SOMa by MIC_1
+    MICtrn[1] = MIC_1^densDep * turnover[1]  * fPHYS[1] #MIC_1 turnover to PHYSICAL SOM
+    MICtrn[2] = MIC_1^densDep * turnover[1]  * fCHEM[1] #MIC_1 turnover to CHEMICAL SOM
+    MICtrn[3] = MIC_1^densDep * turnover[1]  * fAVAI[1] #MIC_1 turnover to AVAILABLE SOM
+    
+    #Flows to and from MIC_2
+    LITmin[3] = MIC_2 * VMAX[4] * LIT_1 / (KM[4] + LIT_1)#LIT_1)   #decomp of MET litter
+    LITmin[4] = MIC_2 * VMAX[5] * LIT_2 / (KM[5] + LIT_2)#LIT_2)   #decomp of SRUCTURAL litter
+    SOMmin[2] = MIC_2 * VMAX[6] * SOM_3 / (KM[6] + SOM_3)#SOM_3)   #decomp of SOMa by MIC_2
+    MICtrn[4] = MIC_2^densDep * turnover[2]  * fPHYS[2]                  #MIC_2 turnover to PHYSICAL  SOM
+    MICtrn[5] = MIC_2^densDep * turnover[2]  * fCHEM[2]                  #MIC_2 turnover to CHEMICAL  SOM
+    MICtrn[6] = MIC_2^densDep * turnover[2]  * fAVAI[2]                  #MIC_2 turnover to AVAILABLE SOM
+    
+    DEsorb    = SOM_1 * desorb  #* (MIC_1 + MIC_2)		#desorbtion of PHYS to AVAIL (function of fCLAY)
+    OXIDAT    = ((MIC_2 * VMAX[5] * SOM_2 / (KO[2]*KM[5] + SOM_2)) +#SOM_2)) +
+                 (MIC_1 * VMAX[2] * SOM_2 / (KO[1]*KM[2] + SOM_2)))#SOM_2)))  #oxidation of C to A
+    
+    #Nitrogen fluxes
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #Flows to and from MIC_1
+    LITminN[1] =  LITmin[1]*LIT_1_N/(LIT_1+1e-100)#LITmin[1]/CN_m
+    LITminN[2] =  LITmin[2]*LIT_2_N/(LIT_2++1e-100)#LITmin[2]/CN_s
+    SOMminN[1] =  SOMmin[1]*(SOM_3_N/(SOM_3++1e-100))#SOMmin[1]*(SOM_3_N/SOM_3)#*relRateN
+    MICtrnN[1] =  MICtrn[1]*MIC_1_N/(MIC_1+1e-100)#MICtrn[1]/CN_r
+    MICtrnN[2] =  MICtrn[2]*MIC_1_N/(MIC_1+1e-100)#MICtrn[2]/CN_r
+    MICtrnN[3] =  MICtrn[3]*MIC_1_N/(MIC_1+1e-100)#MICtrn[3]/CN_r
+    
+    #Flows to and from MIC_2
+    LITminN[3] =  LITmin[3]*LIT_1_N/(LIT_1+1e-100)#LITmin[3]/CN_m
+    LITminN[4] =  LITmin[4]*LIT_2_N/(LIT_2+1e-100)#LITmin[4]/CN_s
+    SOMminN[2] =  SOMmin[2]*(SOM_3_N/(SOM_3+1e-100))#SOMmin[2]*(SOM_3_N/SOM_3)#*relRateN
+    MICtrnN[4] =  MICtrn[4]*MIC_2_N/(MIC_2+1e-100)#MICtrn[4]/CN_K
+    MICtrnN[5] =  MICtrn[5]*MIC_2_N/(MIC_2+1e-100)#MICtrn[5]/CN_K
+    MICtrnN[6] =  MICtrn[6]*MIC_2_N/(MIC_2+1e-100)#MICtrn[6]/CN_K
+    
+    DEsorbN    =  DEsorb[1]*(SOM_1_N/(SOM_1+1e-100))#*relRateN
+    OXIDATN    =  OXIDAT[1]*(SOM_2_N/(SOM_2+1e-100))#*relRateN
+    DINup[1]   = (1-Nleak)*DIN*MIC_1/(MIC_1+MIC_2+1e-100) #Partitions DIN between microbial pools based on relative biomass
+    DINup[2]   = (1-Nleak)*DIN*MIC_2/(MIC_1+MIC_2+1e-100)
+  
+    #####
+    upMIC_1    = CUE[1]*(LITmin[1] + SOMmin[1]) + CUE[2]*(LITmin[2])
+    upMIC_1_N  = NUE*(LITminN[1] + SOMminN[1]) + NUE*(LITminN[2]) + DINup[1]
+    CNup[1]    = (upMIC_1)/(upMIC_1_N+1e-100) #Trying to optimize run speed here by avoiding /0
+    Overflow[1] = (upMIC_1) - (upMIC_1_N)*min(CN_r, CNup[1])
+    Nspill[1]   = (upMIC_1_N) - (upMIC_1)/max(CN_r, CNup[1])
+  
+    upMIC_2    = CUE[3]*(LITmin[3] + SOMmin[2]) + CUE[4]*(LITmin[4])
+    upMIC_2_N  = NUE*(LITminN[3] + SOMminN[2]) + NUE*(LITminN[4]) + DINup[2]
+    CNup[2]    = (upMIC_2)/(upMIC_2_N+1e-100)
+    Overflow[2] = (upMIC_2) - (upMIC_2_N)*min(CN_K, CNup[2])
+    Nspill[2]   = (upMIC_2_N) - (upMIC_2)/max(CN_K, CNup[2])
+    ######
+    
+    dLIT_1 = Inputs[1]*(1-FI[1]) - LITmin[1] - LITmin[3]
+    dLIT_2 = Inputs[2]*(1-FI[2]) - LITmin[2] - LITmin[4]
+    dMIC_1 = CUE[1]*(LITmin[1] + SOMmin[1]) + CUE[2]*(LITmin[2]) - sum(MICtrn[1:3]) - Overflow[1]
+    dMIC_2 = CUE[3]*(LITmin[3] + SOMmin[2]) + CUE[4]*(LITmin[4]) - sum(MICtrn[4:6]) - Overflow[2] 
+    dSOM_1 = Inputs[1]*FI[1] + MICtrn[1] + MICtrn[4] - DEsorb 
+    dSOM_2 = Inputs[2]*FI[2] + MICtrn[2] + MICtrn[5] - OXIDAT
+    dSOM_3 = MICtrn[3] + MICtrn[6] + DEsorb + OXIDAT - SOMmin[1] - SOMmin[2]
+
+    dLIT_1_N = Inputs[1]*(1-FI[1])/CN_m - LITminN[1] - LITminN[3]
+    dLIT_2_N = Inputs[2]*(1-FI[2])/CN_s - LITminN[2] - LITminN[4]
+    dMIC_1_N = NUE*(LITminN[1] + SOMminN[1]) + NUE*(LITminN[2]) - sum(MICtrnN[1:3]) + DINup[1] - Nspill[1]
+    dMIC_2_N = NUE*(LITminN[3] + SOMminN[2]) + NUE*(LITminN[4]) - sum(MICtrnN[4:6]) + DINup[2] - Nspill[2]
+    dSOM_1_N = Inputs[1]*FI[1]/CN_m + MICtrnN[1] + MICtrnN[4] - DEsorbN
+    dSOM_2_N = Inputs[2]*FI[2]/CN_s + MICtrnN[2] + MICtrnN[5] - OXIDATN
+    dSOM_3_N = MICtrnN[3] + MICtrnN[6] + DEsorbN + OXIDATN - SOMminN[1] - SOMminN[2]
+    
+    dDIN = (1-NUE)*(LITminN[1] + LITminN[2] + SOMminN[1]) +  #Inputs from r decomp
+      (1-NUE)*(LITminN[3] + LITminN[4] + SOMminN[2]) +  #Inputs from K decomp
+      Nspill[1] + Nspill[2] - DINup[1] - DINup[2]    #Uptake to microbial pools and spillage
+    LeachingLoss = Nleak*DIN
+    dDIN = dDIN-LeachingLoss #N leaching losses    
+    
+    list(c(dLIT_1, dLIT_2, dMIC_1, dMIC_2, dSOM_1, dSOM_2, dSOM_3,dLIT_1_N, dLIT_2_N, dMIC_1_N, dMIC_2_N, dSOM_1_N, dSOM_2_N, dSOM_3_N,dDIN))
+  })
+}
+
+```
+
+
+## Forward tracer tier function
+This is the "tracer tier" function, which calculates fluxes that are proportional to fluxes in the underlying soil. It acts kind of like an isotopic tracer, tracking flows of C and N without altering the underlying dynamics of the model. It first calculates pools and fluxes for the underlying model using the same math as the FXEQ function.
+```{r}
+TFXEQ <- function(t, y, pars) {
+  with (as.list(c(y, pars)),{
+    
+        #Carbon fluxes
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #Flows to and from MIC_1
+    LITmin[1] = MIC_1 * VMAX[1] * LIT_1 / (KM[1] + LIT_1)#LIT_1)   #MIC_1 decomp of MET lit
+    LITmin[2] = MIC_1 * VMAX[2] * LIT_2 / (KM[2] + LIT_2)#LIT_2)   #MIC_1 decomp of STRUC lit
+    SOMmin[1] = MIC_1 * VMAX[3] * SOM_3 / (KM[3] + SOM_3)#SOM_3)   #decomp of SOMa by MIC_1
+    MICtrn[1] = MIC_1^densDep * turnover[1]  * fPHYS[1] #MIC_1 turnover to PHYSICAL SOM
+    MICtrn[2] = MIC_1^densDep * turnover[1]  * fCHEM[1] #MIC_1 turnover to CHEMICAL SOM
+    MICtrn[3] = MIC_1^densDep * turnover[1]  * fAVAI[1] #MIC_1 turnover to AVAILABLE SOM
+    
+    #Flows to and from MIC_2
+    LITmin[3] = MIC_2 * VMAX[4] * LIT_1 / (KM[4] + LIT_1)#LIT_1)   #decomp of MET litter
+    LITmin[4] = MIC_2 * VMAX[5] * LIT_2 / (KM[5] + LIT_2)#LIT_2)   #decomp of SRUCTURAL litter
+    SOMmin[2] = MIC_2 * VMAX[6] * SOM_3 / (KM[6] + SOM_3)#SOM_3)   #decomp of SOMa by MIC_2
+    MICtrn[4] = MIC_2^densDep * turnover[2]  * fPHYS[2]                  #MIC_2 turnover to PHYSICAL  SOM
+    MICtrn[5] = MIC_2^densDep * turnover[2]  * fCHEM[2]                  #MIC_2 turnover to CHEMICAL  SOM
+    MICtrn[6] = MIC_2^densDep * turnover[2]  * fAVAI[2]                  #MIC_2 turnover to AVAILABLE SOM
+    
+    DEsorb    = SOM_1 * desorb  #* (MIC_1 + MIC_2)		#desorbtion of PHYS to AVAIL (function of fCLAY)
+    OXIDAT    = ((MIC_2 * VMAX[5] * SOM_2 / (KO[2]*KM[5] + SOM_2)) +#SOM_2)) +
+                 (MIC_1 * VMAX[2] * SOM_2 / (KO[1]*KM[2] + SOM_2)))#SOM_2)))  #oxidation of C to A
+    
+    #Nitrogen fluxes
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #Flows to and from MIC_1
+    LITminN[1] =  LITmin[1]*LIT_1_N/(LIT_1+1e-100)#LITmin[1]/CN_m
+    LITminN[2] =  LITmin[2]*LIT_2_N/(LIT_2++1e-100)#LITmin[2]/CN_s
+    SOMminN[1] =  SOMmin[1]*(SOM_3_N/(SOM_3++1e-100))#SOMmin[1]*(SOM_3_N/SOM_3)#*relRateN
+    MICtrnN[1] =  MICtrn[1]*MIC_1_N/(MIC_1+1e-100)#MICtrn[1]/CN_r
+    MICtrnN[2] =  MICtrn[2]*MIC_1_N/(MIC_1+1e-100)#MICtrn[2]/CN_r
+    MICtrnN[3] =  MICtrn[3]*MIC_1_N/(MIC_1+1e-100)#MICtrn[3]/CN_r
+    
+    #Flows to and from MIC_2
+    LITminN[3] =  LITmin[3]*LIT_1_N/(LIT_1+1e-100)#LITmin[3]/CN_m
+    LITminN[4] =  LITmin[4]*LIT_2_N/(LIT_2+1e-100)#LITmin[4]/CN_s
+    SOMminN[2] =  SOMmin[2]*(SOM_3_N/(SOM_3+1e-100))#SOMmin[2]*(SOM_3_N/SOM_3)#*relRateN
+    MICtrnN[4] =  MICtrn[4]*MIC_2_N/(MIC_2+1e-100)#MICtrn[4]/CN_K
+    MICtrnN[5] =  MICtrn[5]*MIC_2_N/(MIC_2+1e-100)#MICtrn[5]/CN_K
+    MICtrnN[6] =  MICtrn[6]*MIC_2_N/(MIC_2+1e-100)#MICtrn[6]/CN_K
+    
+    DEsorbN    =  DEsorb[1]*(SOM_1_N/(SOM_1+1e-100))#*relRateN
+    OXIDATN    =  OXIDAT[1]*(SOM_2_N/(SOM_2+1e-100))#*relRateN
+    DINup[1]   = (1-Nleak)*DIN*MIC_1/(MIC_1+MIC_2+1e-100) #Partitions available DIN between microbial pools based on relative biomass
+    DINup[2]   = (1-Nleak)*DIN*MIC_2/(MIC_1+MIC_2+1e-100)
+  
+    #####
+    upMIC_1    = CUE[1]*(LITmin[1] + SOMmin[1]) + CUE[2]*(LITmin[2])
+    upMIC_1_N  = NUE*(LITminN[1] + SOMminN[1]) + NUE*(LITminN[2]) + DINup[1]
+    CNup[1]    = (upMIC_1)/(upMIC_1_N+1e-100) #Trying to optimize run speed here by avoiding /0
+    Overflow[1] = (upMIC_1) - (upMIC_1_N)*min(CN_r, CNup[1])
+    Nspill[1]   = (upMIC_1_N) - (upMIC_1)/max(CN_r, CNup[1])
+  
+    upMIC_2    = CUE[3]*(LITmin[3] + SOMmin[2]) + CUE[4]*(LITmin[4])
+    upMIC_2_N  = NUE*(LITminN[3] + SOMminN[2]) + NUE*(LITminN[4]) + DINup[2]
+    CNup[2]    = (upMIC_2)/(upMIC_2_N+1e-100)
+    Overflow[2] = (upMIC_2) - (upMIC_2_N)*min(CN_K, CNup[2])
+    Nspill[2]   = (upMIC_2_N) - (upMIC_2)/max(CN_K, CNup[2])
+    ######
+    
+    dLIT_1 = Inputs[1]*(1-FI[1]) - LITmin[1] - LITmin[3]
+    dLIT_2 = Inputs[2]*(1-FI[2]) - LITmin[2] - LITmin[4]
+    dMIC_1 = CUE[1]*(LITmin[1] + SOMmin[1]) + CUE[2]*(LITmin[2]) - sum(MICtrn[1:3]) - Overflow[1]
+    dMIC_2 = CUE[3]*(LITmin[3] + SOMmin[2]) + CUE[4]*(LITmin[4]) - sum(MICtrn[4:6]) - Overflow[2] 
+    dSOM_1 = Inputs[1]*FI[1] + MICtrn[1] + MICtrn[4] - DEsorb 
+    dSOM_2 = Inputs[2]*FI[2] + MICtrn[2] + MICtrn[5] - OXIDAT
+    dSOM_3 = MICtrn[3] + MICtrn[6] + DEsorb + OXIDAT - SOMmin[1] - SOMmin[2]
+
+    dLIT_1_N = Inputs[1]*(1-FI[1])/CN_m - LITminN[1] - LITminN[3]
+    dLIT_2_N = Inputs[2]*(1-FI[2])/CN_s - LITminN[2] - LITminN[4]
+    dMIC_1_N = NUE*(LITminN[1] + SOMminN[1]) + NUE*(LITminN[2]) - sum(MICtrnN[1:3]) + DINup[1] - Nspill[1]
+    dMIC_2_N = NUE*(LITminN[3] + SOMminN[2]) + NUE*(LITminN[4]) - sum(MICtrnN[4:6]) + DINup[2] - Nspill[2]
+    dSOM_1_N = Inputs[1]*FI[1]/CN_m + MICtrnN[1] + MICtrnN[4] - DEsorbN
+    dSOM_2_N = Inputs[2]*FI[2]/CN_s + MICtrnN[2] + MICtrnN[5] - OXIDATN
+    dSOM_3_N = MICtrnN[3] + MICtrnN[6] + DEsorbN + OXIDATN - SOMminN[1] - SOMminN[2]
+    
+    dDIN = (1-NUE)*(LITminN[1] + LITminN[2] + SOMminN[1]) +  #Inputs from r decomp
+      (1-NUE)*(LITminN[3] + LITminN[4] + SOMminN[2]) +  #Inputs from K decomp
+      Nspill[1] + Nspill[2] - DINup[1] - DINup[2]    #Uptake to microbial pools and spillage
+    LeachingLoss = Nleak*DIN
+    dDIN = dDIN-LeachingLoss #N leaching losses  
+    
+    #Tracer tier calculations
+    # III. Carbon, tracer
+      TLITmin[1] = TLIT_1/LIT_1*LITmin[1]   #MIC_1 decomp of MET lit
+      TLITmin[2] = TLIT_2/LIT_2*LITmin[2]   #MIC_1 decomp of STRUC lit
+      TSOMmin[1] = TSOM_3/SOM_3*SOMmin[1]   #Decomp of SOMa by MIC_1
+      TMICtrn[1] = TMIC_1/MIC_1*MICtrn[1]   #MIC_1 turnover to SOMp
+      TMICtrn[2] = TMIC_1/MIC_1*MICtrn[2]   #MIC_1 turnover to SOMc
+      TMICtrn[3] = TMIC_1/MIC_1*MICtrn[3]   #MIC_1 turnover to SOMa
+      
+      #Flows to and from MIC_2
+      TLITmin[3] = TLIT_1/LIT_1*LITmin[3]   #decomp of MET litter
+      TLITmin[4] = TLIT_2/LIT_2*LITmin[4]   #decomp of SRUCTURAL litter
+      TSOMmin[2] = TSOM_3/SOM_3*SOMmin[2]   #decomp of PHYSICAL SOM by MIC_1
+      TMICtrn[4] = TMIC_2/MIC_2*MICtrn[4]   #MIC_2 turnover to SOMp
+      TMICtrn[5] = TMIC_2/MIC_2*MICtrn[5]   #MIC_2 turnover to SOMc
+      TMICtrn[6] = TMIC_2/MIC_2*MICtrn[6]   #MIC_2 turnover to SOMa
+      
+      TDEsorb[1]    = TSOM_1/SOM_1*DEsorb[1]#SOM_1[2] * desorb  #* (MIC_1 + MIC_2)  #desorbtion of PHYS to AVAIL (function of fCLAY)
+      TOXIDAT[1]    = TSOM_2/SOM_2*OXIDAT[1]
+      
+      #Flows to and from MIC_1
+      TLITminN[1] =  TLITmin[1]*TLIT_1_N/(TLIT_1+1e-100)
+      TLITminN[2] =  TLITmin[2]*TLIT_2_N/(TLIT_2+1e-100)
+      TMICtrnN[1] =  TMICtrn[1]*TMIC_1_N/(TMIC_1+1e-100)
+      TMICtrnN[2] =  TMICtrn[2]*TMIC_1_N/(TMIC_1+1e-100)
+      TMICtrnN[3] =  TMICtrn[3]*TMIC_1_N/(TMIC_1+1e-100)
+      TSOMminN[1] =  TSOMmin[1]*TSOM_3_N/(TSOM_3+1e-100)  
+      
+      #Flows to and from MIC_2
+      TLITminN[3] =  TLITmin[3]*TLIT_1_N/(TLIT_1+1e-100)
+      TLITminN[4] =  TLITmin[4]*TLIT_2_N/(TLIT_2+1e-100)
+      TMICtrnN[4] =  TMICtrn[4]*TMIC_2_N/(TMIC_2+1e-100)
+      TMICtrnN[5] =  TMICtrn[5]*TMIC_2_N/(TMIC_2+1e-100)
+      TMICtrnN[6] =  TMICtrn[6]*TMIC_2_N/(TMIC_2+1e-100)
+      TSOMminN[2] =  TSOMmin[2]*TSOM_3_N/(TSOM_3+1e-100)
+      
+      TDEsorbN =  TDEsorb*TSOM_1_N/(TSOM_1+1e-100)
+      TOXIDATN =  TOXIDAT*TSOM_2_N/(TSOM_2+1e-100)
+      TDINup[1] = TDIN/(DIN+1e-100)*DINup[1]
+      TDINup[2] = TDIN/(DIN+1e-100)*DINup[2]
+      
+      #####
+      TNimport[1] = fracNImportr*LeachingLoss
+      TNimport[2] = fracNImportK*LeachingLoss
+      
+      upTMIC_1    = CUE[1]*(TLITmin[1] + TSOMmin[1]) + CUE[2]*TLITmin[2]
+      upTMIC_1_N  = NUE*(TLITminN[1] + TSOMminN[1]) + NUE*TLITminN[2] + TDINup[1] + TNimport[1]
+      TCNup[1]    = upTMIC_1/(upTMIC_1_N+1e-100)
+      TOverflow[1] = upTMIC_1 - upTMIC_1_N*min(CN_r, TCNup[1])
+      TNspill[1]   = upTMIC_1_N - upTMIC_1/max(CN_r, TCNup[1])
+      
+      upTMIC_2    = CUE[3]*(TLITmin[3] + TSOMmin[2]) + CUE[4]*TLITmin[4]
+      upTMIC_2_N  = NUE*(TLITminN[3] + TSOMminN[2]) + NUE*TLITminN[4] + TDINup[2] + TNimport[2]
+      TCNup[2]    = upTMIC_2/(upTMIC_2_N+1e-100)
+      TOverflow[2] = upTMIC_2 - upTMIC_2_N*min(CN_K, TCNup[2])
+      TNspill[2]   = upTMIC_2_N - upTMIC_2/max(CN_K, TCNup[2])
+      ######
+      
+      dTLIT_1 = - TLITmin[1] - TLITmin[3]
+      dTLIT_2 = - TLITmin[2] - TLITmin[4]
+      dTMIC_1 = CUE[1]*(TLITmin[1] + TSOMmin[1]) + CUE[2]*TLITmin[2] - sum(TMICtrn[1:3]) - TOverflow[1]
+      dTMIC_2 = CUE[3]*(TLITmin[3] + TSOMmin[2]) + CUE[4]*TLITmin[4] - sum(TMICtrn[4:6]) - TOverflow[2]
+      dTSOM_1 = TMICtrn[1] + TMICtrn[4] - TDEsorb[1]
+      dTSOM_2 = TMICtrn[2] + TMICtrn[5] - TOXIDAT[1]
+      dTSOM_3 = TMICtrn[3] + TMICtrn[6] + TDEsorb[1] + TOXIDAT[1] - TSOMmin[1] - TSOMmin[2] 
+      
+      dTLIT_1_N = - TLITminN[1] - TLITminN[3]
+      dTLIT_2_N = - TLITminN[2] - TLITminN[4]
+      dTMIC_1_N = NUE*TLITminN[1] + NUE*TLITminN[2] - sum(TMICtrnN[1:3]) + TDINup[1] + NUE*TSOMminN[1] + TNimport[1] - TNspill[1]
+      dTMIC_2_N = NUE*TLITminN[3] + NUE*TLITminN[4] - sum(TMICtrnN[4:6]) + TDINup[2] + NUE*TSOMminN[2] + TNimport[2] - TNspill[2]
+      dTSOM_1_N = TMICtrnN[1] + TMICtrnN[4] - TDEsorbN[1]
+      dTSOM_2_N = TMICtrnN[2] + TMICtrnN[5] - TOXIDATN[1]
+      dTSOM_3_N = TMICtrn[3]/CN_r + TMICtrn[6]/CN_K + TDEsorbN[1] + TOXIDATN[1] - TSOMminN[1] - TSOMminN[2]
+      
+      dTDIN = (1-NUE)*(TLITminN[1] + TLITminN[2] + TSOMminN[1]) +  #Inputs from r decomp
+        (1-NUE)*(TLITminN[3] + TLITminN[4] + TSOMminN[2]) +  #Inputs from K decomp
+        TNspill[1] + TNspill[2] - TDINup[1] - TDINup[2]    #Uptake to microbial pools and spillage
+      dTDIN = dTDIN-(Nleak)*TDIN #N leaching losses
+    
+    list(c(dLIT_1, dLIT_2, dMIC_1, dMIC_2, dSOM_1, dSOM_2, dSOM_3, dLIT_1_N, 
+           dLIT_2_N, dMIC_1_N, dMIC_2_N, dSOM_1_N, dSOM_2_N, dSOM_3_N, dDIN,
+           dTLIT_1, dTLIT_2, dTMIC_1, dTMIC_2, dTSOM_1, dTSOM_2, dTSOM_3, dTLIT_1_N, 
+           dTLIT_2_N, dTMIC_1_N, dTMIC_2_N, dTSOM_1_N, dTSOM_2_N, dTSOM_3_N, dTDIN))
+  })
+}
+```
+
+
+# B. LIDET litterbag simulations
+
+## Setting up a place for the steady-state variable values at each site to go:
+```{r}
+SSoutput <<- data.frame(matrix(NA,nrow=14, ncol=19))
+colnames(SSoutput) = c("Site", "MICr","MICK","LITm","LITs","SOMp","SOMc","SOMa",
+               "MICrN","MICKN","LITmN","LITsN","SOMpN","SOMcN","SOMaN","InorgN",
+               "NminTot","NminNet","Resp")
+```
+
+
+## Reading in and cleaning up histogram data:
+```{r}
+histogramData<<-read.csv("histogramDataRedone.csv")
+histogramData[histogramData == 0] <- NA
+histogramData$Study<-as.character(histogramData$Study)
+histogramData$Site<-as.character(histogramData$Site)
+```
+
+
+## Reading in site level data, setting up parameter vectors:
+```{r}
+LTERdata = read.csv("LTER_SITE_1.csv") #site level forcing variables
+ANPP_C  <<- LTERdata$ANPP / 2       # convert to gC/m2/y from g/m2/y
+strSite <<- as.character(LTERdata$Site)  #convert site names to string
+nsites  <<- length(strSite)
+npts   <<- 6*10*14 #6 litter * 10 years * 14 sites
+clay  <<- LTERdata$CLAY2/100 
+tsoi  <<- LTERdata$MAT
+nsites <<- length(LTERdata$Site)
+lig   <<- LTERdata$LIG/100
+Nnew  <<- 1/LTERdata$CN/2.5             #N in litter additions
+fMET1 <<- 0.85 - 0.013 * lig / Nnew    #as partitioned in Daycent
+```
+
+
+## Making vectors to store model results that match temporal resolution of LIDET observations:
+```{r}
+xyLIT  <<- rep(NA, npts) 
+xyTIME <<- rep(NA, npts) 
+xySITE <<- rep(NA, npts) 
+xyOBS  <<- rep(NA, npts)
+xyMIM  <<- rep(NA, npts)
+xyLITN  <<- rep(NA, npts)
+xyOBSN  <<- rep(NA, npts)
+xyMIMN  <<- rep(NA, npts)
+xyMIMN2  <<- rep(NA, npts)
+xyMIMLitC = rep(NA, npts)
+xyMIMAllC = rep(NA, npts)
+xyMIMLitN = rep(NA, npts)
+xyMIMAllN = rep(NA, npts)
+xyCount <<- 1
+```
+
+
+## LIDET litter characteristics across all sites:
+```{r}
+LITtype  <<- c('TRAEf', 'PIREf','THPLf','ACSAf','QUPRf','DRGLf')
+bagMET   <<- c(10.6, 36.2, 37.4, 56.8, 37.1, 49.3) #from Gordon's LitterCharacteristics.txt
+bagLIG   <<- c(16.2, 19.2, 26.7, 15.9, 23.5, 10.9) # % from Gordon's LitterCharacteristics.txt
+bagN     <<- c(0.38, 0.59, 0.62, 0.81, 1.03, 1.97) # %N 
+bagCN    <<- c(133.3,92.7, 83.1, 61.8, 50.5, 24.2)
+calcN    <<- (1 / bagCN) / 2.5 * 100
+calcMET  <<- 0.85 - 0.013 * bagLIG/calcN #as calculated in DAYCENT
+bagMET   <<- calcMET
+```
+
+
+## Function definitions
+### Function to read in LIDET observations for a given site:
+```{r}
+readLIDETObservations = function() {
+  obs_in  <<- c('LIDET_SITE_obs/Archive/OBS_',strSite[s],'_LIDET.csv')
+  obs_in  <<- paste(obs_in, collapse="")     
+  LIDET_obs <<- read.csv(obs_in, header=TRUE) 
+  obsyear  <<- LIDET_obs$year
+  obsmass  <<- LIDET_obs$mean
+  obsSD    <<- LIDET_obs$sd
+  obsmassN  <<- LIDET_obs$mean_N/100
+  obsSDN    <<- LIDET_obs$sd_N/100
+  nobsyears   <<- length(obsyear)
+  obsindex       <<- rep(NA, nobsyears)
+  obsMASS     <<- array(NA, dim=c(6,nobsyears))
+  obsMASS[1,] <<- LIDET_obs$TRAEf
+  obsMASS[2,] <<- LIDET_obs$PIREf
+  obsMASS[3,] <<- LIDET_obs$THPLf
+  obsMASS[4,] <<- LIDET_obs$ACSAf
+  obsMASS[5,] <<- LIDET_obs$QUPRf
+  obsMASS[6,] <<- LIDET_obs$DRGLf
+  obsMASSN     <<- array(NA, dim=c(6,nobsyears))
+  obsMASSN[1,] <<- LIDET_obs$TRAEf_Nfrac
+  obsMASSN[2,] <<- LIDET_obs$PIREf_Nfrac
+  obsMASSN[3,] <<- LIDET_obs$THPLf_Nfrac
+  obsMASSN[4,] <<- LIDET_obs$ACSAf_Nfrac
+  obsMASSN[5,] <<- LIDET_obs$QUPRf_Nfrac
+  obsMASSN[6,] <<- LIDET_obs$DRGLf_Nfrac
+}
+```
+
+
+### Function to calculate site-specific parameters:
+```{r}
+siteSpecificParameters = function() {
+     
+  #Parameters related to inputs
+  EST_LIT_in  <<- ANPP_C[s] / (365*24)   #gC/m2/h (from g/m2/y, Knapp et al. Science 2001)
+  BAG_LIT_in  <<- 100      #gC/m2/h
+  soilDepth       <<- 30
+  h2y         <<- 24*365
+  MICROtoECO  <<- soilDepth * 1e4 * 1e6 / 1e6   #mgC/cm3 to kgC/km2
+  EST_LIT     <<- EST_LIT_in  * 1e3 / 1e4    #mgC/cm2/h 
+  BAG_LIT     <<- BAG_LIT_in  * 1e3 / 1e4    #mgC/cm2/h
+  fMET        <<- fMET1[s]
+  Inputs        <<- array(NA, dim=2)              #Litter inputs to MET/STR
+  Inputs[1]     <<- (EST_LIT / soilDepth) * fMET      #partitioned to layers
+  Inputs[2]     <<- (EST_LIT / soilDepth) * (1-fMET)
+  FI       <<- c(0.05,0.3)#c(0.05, 0.05)#
+  
+  BAG      <<- array(NA, dim=c(6,2))              #litter BAG inputs to MET/STR
+  for (i in 1:6) {
+    BAG[i,1]   <<- (BAG_LIT / soilDepth) * bagMET[i]      #partitioned to layers
+    BAG[i,2]   <<- (BAG_LIT / soilDepth) * (1-bagMET[i])
+  }
+  
+  #Parameters related to stabilization mechanisms
+  fCLAY       <<- clay[s]
+  fPHYS    <<- 0.1 * c(.15 * exp(1.3*fCLAY), 0.1 * exp(0.8*fCLAY)) #Sulman et al. 2018
+  fCHEM    <<- 3*c(0.1 * exp(-3*fMET) * 1, 0.3 * exp(-3*fMET) * 1) 	#Sulman et al. 2018 #fraction to SOMc
+  fAVAI    <<- 1-(fPHYS + fCHEM)
+  desorb   <<- 2e-5      * exp(-4.5*(fCLAY)) #Sulman et al. 2018
+  desorb   <<- 0.05*desorb
+  Nleak   <<- 0.2#.1   #This is the proportion N lost from DIN pool at each hourly time step.
+  
+  #Parameters related to microbial physiology and pool stoichiometry
+  CUE        <<- c(0.55, 0.25, 0.75, 0.35)  #for LITm and LITs entering MICr and MICK, respectively
+  NUE        <<- .85         #Nitrogen stoichiometry of fixed pools
+  CN_m        <<- 15
+  CN_s        <<- (LTERdata$CN[s]-CN_m*fMET)/(1-fMET)
+  CN_s_BAG    <<-  (bagCN-CN_m*bagMET)/(1-bagMET)
+  CN_r        <<-6#5
+  CN_K        <<-10#8
+  
+  turnover      <<- c(5.2e-4*exp(0.3*(fMET)), 2.4e-4*exp(0.1*(fMET)))	#WORKS BETTER FOR N_RESPONSE RATIO
+  turnover_MOD1 <<- sqrt(ANPP_C[s]/100)  #basicaily standardize against NWT
+  turnover_MOD1[turnover_MOD1 < 0.6] <<- 0.6 # correction not used in LIDET resutls 
+  turnover_MOD1[turnover_MOD1 > 1.3] <<- 1.3      #Sulman et al. 2018
+  turnover      <<- turnover * turnover_MOD1
+  turnover <<- turnover/2.2
+  turnover <<- turnover^2*0.55/(.45*Inputs)
+  densDep <<- 2#1 #This exponent controls the density dependence of microbial turnover. Currently anything other than 1 breaks things.
+  
+  fracNImportr  <<-  0 #No N import for r strategists
+  fracNImportK  <<-  0.2 #Only K strategists can import N
+  
+  #Parameters related to temperature-sensitive enzyme kinetics
+  TSOI        <<- tsoi[s]   
+  #Calculate Vmax & (using parameters from German 2012)
+  #from "gamma" simulations "best", uses max Vslope, min Kslope
+  Vslope   <<- array(NA,dim=6)
+  Vslope[1]<<- 0.043 #META LIT to MIC_1
+  Vslope[2]<<- 0.043 #STRU LIT to MIC_1 
+  Vslope[3]<<- 0.063 #AVAI SOM to MIC_1 
+  Vslope[4]<<- 0.043 #META LIT to MIC_2 
+  Vslope[5]<<- 0.063 #STRU LIT to MIC_2 
+  Vslope[6]<<- 0.063 #AVAI SOM to MIC_2 
+  Vint     <<- 5.47
+  aV       <<- 8e-6
+  aV       <<- aV*.06 #Forward
+  Vmax     <<- exp(TSOI * Vslope + Vint) * aV
+  
+  Kslope   <<- array(NA,dim=6)
+  Kslope[1]<<- 0.017 #META LIT to MIC_1
+  Kslope[2]<<- 0.027 #STRU LIT to MIC_1 
+  Kslope[3]<<- 0.017 #AVAI SOM to MIC_1 
+  Kslope[4]<<- 0.017 #META LIT to MIC_2
+  Kslope[5]<<- 0.027 #STRU LIT to MIC_2
+  Kslope[6]<<- 0.017 #AVAI SOM to MIC_2
+  Kint     <<- 3.19
+  aK       <<- 10
+  aK       <<- aK/20 #Forward
+  Km       <<- exp(Kslope * TSOI + Kint) * aK
+  
+  #Enzyme kinetic modifiers:
+  k        <<- 2.0    #2.0			#REDUCED FROM 3 TO 1, REDUCES TEXTURE EFFECTS ON SOMa decay
+  a        <<- 2.0    #2.2			#increased from 4.0 to 4.5
+  cMAX     <<- 1.4                    #ORIG 1.4 Maximum CHEM SOM scalar w/   0% Clay 
+  cMIN     <<- 1.2                    #ORIG 1.4 Minimum CHEM SOM scalar w/ 100% Clay 
+  cSLOPE   <<- cMIN - cMAX            #Slope of linear function of cSCALAR for CHEM SOM  
+  pSCALAR  <<- a * exp(-k*(sqrt(fCLAY)))  #Scalar for texture effects on SOMp
+  
+  #------------!!MODIFIERS AS IN MIMICS2_b!!---------------
+  MOD1     <<- c(10, 2*.75, 10, 3, 3*.75, 2) 
+  MOD2     <<- c( 8, 2 ,4 * pSCALAR, 2, 4, 6 * pSCALAR) 	
+  
+  VMAX     <<- Vmax * MOD1
+  KM       <<- Km / MOD2
+  KO       <<- c(6,6)     #Values from Sulman et al. 2018
+}
+```
+
+
+### Function to initialize the underlying pool values:
+```{r}
+initializePools = function() {
+  LIT_1  <<- 1
+  LIT_2  <<- 1
+  MIC_1  <<- 1
+  MIC_2  <<- 1
+  SOM_1  <<- 1
+  SOM_2  <<- 1
+  SOM_3  <<- 1
+  
+  LIT_1_N  <<- .1
+  LIT_2_N  <<- .1
+  MIC_1_N  <<- .1
+  MIC_2_N  <<- .1
+  SOM_1_N  <<- .1
+  SOM_2_N  <<- .1
+  SOM_3_N  <<- .1
+  DIN      <<- .1
+  
+  LITmin  <<- array(NA, dim=4)
+  MICtrn  <<- array(NA, dim=6)
+  SOMmin  <<- array(NA, dim=2)
+  DEsorb  <<- array(NA, dim=1)
+  OXIDAT  <<- array(NA, dim=1)
+  LITminN   <<- array(NA, dim=4)
+  MICtrnN   <<- array(NA, dim=6)
+  SOMminN   <<- array(NA, dim=2)
+  DEsorbN   <<- array(NA, dim=1)
+  OXIDATN   <<- array(NA, dim=1)
+  DINup     <<- array(NA, dim=2)
+  Overflow  <<- array(NA, dim=2)
+  Nspill    <<- array(NA, dim=2)
+  CNup      <<- array(NA, dim=2)
+  upMIC_1   <<-  array(NA, dim=1)
+  upMIC_1_N <<-  array(NA, dim=1)
+  upMIC_2   <<-  array(NA, dim=1)
+  upMIC_2_N <<-  array(NA, dim=1)
+}
+```
+
+
+### Function to initialize the tracer pool values:
+```{r}
+initializeTracerPools = function() {
+  TLIT_1    <<- 0
+  TLIT_2    <<- 0
+  TMIC_1    <<- 0
+  TMIC_2    <<- 0
+  TSOM_1    <<- 0
+  TSOM_2    <<- 0
+  TSOM_3    <<- 0
+  
+  TLIT_1_N    <<- 0
+  TLIT_2_N    <<- 0
+  TMIC_1_N    <<- 0
+  TMIC_2_N    <<- 0
+  TSOM_1_N    <<- 0
+  TSOM_2_N    <<- 0
+  TSOM_3_N    <<- 0
+  TDIN        <<- 0
+
+  TLITmin  <<- array(NA, dim=4)
+  TMICtrn  <<- array(NA, dim=6)
+  TSOMmin  <<- array(NA, dim=2)
+  TDEsorb  <<- array(NA, dim=1)
+  TOXIDAT  <<- array(NA, dim=1)
+  TLITminN  <<- array(NA, dim=4)
+  TMICtrnN  <<- array(NA, dim=6)
+  TSOMminN  <<- array(NA, dim=2)
+  TDEsorbN  <<- array(NA, dim=1)
+  TOXIDATN  <<- array(NA, dim=1)
+  TDINup    <<- array(NA, dim=2)
+  TOverflow <<- array(NA, dim=2)
+  TNspill   <<- array(NA, dim=2)
+  TCNup     <<- array(NA, dim=2)
+  
+  upTMIC_1   <<-  array(NA, dim=1)
+  upTMIC_1_N <<-  array(NA, dim=1)
+  upTMIC_2   <<-  array(NA, dim=1)
+  upTMIC_2_N <<-  array(NA, dim=1)
+  
+  TNimport  <<- array(NA, dim=2)
+  LeachingLoss <<- 0
+}
+```
+
+
+### Function to find steady state for a given parameter set using stode:
+```{r}
+findSteadyState = function() {
+  Tpars <<- c( Inputs = Inputs, VMAX = VMAX, KM = KM, CUE = CUE, 
+              fPHYS = fPHYS, fCHEM = fCHEM, fAVAI = fAVAI, FI = FI, 
+              turnover = turnover, LITmin = LITmin, SOMmin = SOMmin, MICtrn = MICtrn, 
+              desorb = desorb, DEsorb = DEsorb, OXIDAT = OXIDAT,
+              LITminN = LITminN, SOMminN = SOMminN, MICtrnN = MICtrnN,
+              DEsorbN = DEsorbN, OXIDATN = OXIDATN,
+              KO = KO,
+              CNup=CNup, DINup=DINup,Nspill=Nspill, Overflow=Overflow, 
+              upMIC_1=upMIC_1, upMIC_1_N=upMIC_1_N,
+              upMIC_2=upMIC_2, upMIC_2_N=upMIC_2_N,
+              NUE=NUE, CN_m=CN_m, CN_s=CN_s, CN_r=CN_r, CN_K=CN_K,Nleak=Nleak,densDep=densDep)
+    Ty    <<- c(LIT_1 = LIT_1, LIT_2 = LIT_2, 
+              MIC_1 = MIC_1, MIC_2 = MIC_2, 
+              SOM_1 = SOM_1, SOM_2 = SOM_2, SOM_3 = SOM_3,
+              LIT_1_N = LIT_1_N, LIT_2_N = LIT_2_N, 
+              MIC_1_N = MIC_1_N, MIC_2_N = MIC_2_N, 
+              SOM_1_N = SOM_1_N, SOM_2_N = SOM_2_N, SOM_3_N = SOM_3_N,
+              DIN = DIN)
+  test  <<- stode(y = Ty, time = 1e8, fun = FXEQ, parms = Tpars, positive = TRUE)
+  test[[1]]
+}
+```
+
+
+### Function to plot steady state solution:
+```{r}
+plotSteadyState <- function(){
+  
+    #Output values to build figures from
+    nday   <- 365 * spinupYears			
+    daynum    <- seq(1,nday,1)
+    yearnum   <- daynum/365
+    doy    <- 1
+  
+    #Setting up arrays to store daily output data
+    LIT    <- array(NA, dim = c(2,nday))
+    MIC    <- array(NA, dim = c(2,nday))
+    SOM    <- array(NA, dim = c(3,nday))
+    LITN   <- array(NA, dim = c(2,nday))
+    MICN   <- array(NA, dim = c(2,nday))
+    SOMN   <- array(NA, dim = c(3,nday))
+    InorgN    <- array(NA, dim = c(1,nday))
+    LITminNMetr   <- array(NA, dim = c(1,nday))
+    LITminNStrucr <- array(NA, dim = c(1,nday))
+    SOMminNr      <- array(NA, dim = c(1,nday))
+    LITminNMetK   <- array(NA, dim = c(1,nday))
+    LITminNStrucK <- array(NA, dim = c(1,nday))
+    SOMminNK      <- array(NA, dim = c(1,nday))
+  
+    DINuptake     <- array(NA, dim = c(2,nday))
+    Nspillage     <- array(NA, dim = c(2,nday))
+    LLoss         <- array(NA, dim = c(1,nday))
+    Resp         <- array(NA, dim = c(1,nday))
+    MicCOverflow  <-array(NA, dim = c(2,nday))
+    MicNflux  <- array(NA, dim = c(2,nday))
+  
+    #Initializing pools from steady-state solution
+    poolValues = test[[1]]
+    
+    for (d in 1:nday)  {
+      for (h in 1:24)   {
+        dpoolValues=FXEQ(1, poolValues, Tpars)
+        dpoolValues=dpoolValues[[1]]
+        names(dpoolValues)=names(poolValues)
+        poolValues=poolValues+dpoolValues
+        
+        if (h == 24) {
+        LIT[1,d] <- poolValues[1]
+        LIT[2,d] <- poolValues[2]
+        MIC[1,d] <- poolValues[3]
+        MIC[2,d] <- poolValues[4]
+        SOM[1,d] <- poolValues[5]
+        SOM[2,d] <- poolValues[6]
+        SOM[3,d] <- poolValues[7]
+        
+        LITN[1,d] <- poolValues[8]
+        LITN[2,d] <- poolValues[9]
+        MICN[1,d] <- poolValues[10]
+        MICN[2,d] <- poolValues[11]
+        SOMN[1,d] <- poolValues[12]
+        SOMN[2,d] <- poolValues[13]
+        SOMN[3,d] <- poolValues[14]
+        InorgN[1,d]<-poolValues[15]
+
+        if (doy == 365) {
+          doy <- 1
+          print(paste(c("finished spinup year", yearnum[d])))
+        } else {
+          doy <- doy + 1
+        } #close day of year counter
+      } #close daily results output
+      
+    } #close hour loop
+  } #close daily loop      
+  
+  #########
+    
+#Use outputted values to create steady-state figures
+StackedCol=c("#66ccff","#3399cc","#006699","#66ffcc","#009966","#ff6666","#cc3333","#ff9966")
+StackedCol2=c("steelblue4","indianred4","rosybrown3","steelblue1","indianred3","rosybrown1")
+
+dfC=data.frame(yearnum,
+               SOM[1,], SOM[2,], SOM[3,],
+               MIC[1,], MIC[2,],
+               LIT[1,],LIT[2,])
+dfC=subset(dfC, yearnum>spinupYears-5)
+dataLongC = melt(dfC, id.vars="year",variable.name="Pool", value.name = "MassC")
+CInit=SOM[1,1000]+SOM[2,1000]+SOM[3,1000]+MIC[1,1000]+MIC[2,1000]+LIT[1,1000]+LIT[2,1000]
+CInitMin=SOM[1,1000]+SOM[2,1000]+SOM[3,1000]+MIC[1,1000]+MIC[2,1000]
+
+dfN=data.frame(yearnum,
+               SOMN[1,], SOMN[2,], SOMN[3,],
+               MICN[1,], MICN[2,],
+               LITN[1,],LITN[2,],
+               InorgN[1,])
+dfN=subset(dfN,yearnum>spinupYears-5)
+dataLongN = melt(dfN, id.vars="year",variable.name="Pool", value.name = "MassN")
+NInit=SOMN[1,1000]+SOMN[2,1000]+SOMN[3,1000]+MICN[1,1000]+MICN[2,1000]+LITN[1,1000]+LITN[2,1000]+ InorgN[1,1000]
+
+dfNsource=data.frame(yearnum,
+               SOMminNK[1,], LITminNStrucK[1,], LITminNMetK[1,], 
+               SOMminNr[1,], LITminNStrucr[1,], LITminNMetr[1,])
+dfNsource=subset(dfNsource,yearnum>spinupYears-5)
+dataLongNsource = melt(dfNsource, id.vars="year",variable.name="Pool", value.name = "MassN")
+NSourceInit=SOMminNK[1,1000]+LITminNStrucK[1,1000]+LITminNMetK[1,1000]+SOMminNr[1,1000]+LITminNStrucr[1,1000]+LITminNMetr[1,1000]
+
+CStacked = ggplot(dataLongC, aes(x=dataLongC$yearnum,y=dataLongC$MassC,fill=dataLongC$Pool))+geom_area(position='stack')
+print(CStacked + xlab("Year") + ylab("Mass C (mg/cm3 in top 30 cm)") +
+        ggtitle(c(strSite[s])) +
+        geom_hline(yintercept=CInit, linetype="dashed", color = "black") +
+        scale_fill_manual(values=StackedCol,
+                          name="Pool",
+                          labels=c("SOMp","SOMc","SOMa","MICr","MICk","LITm","LITs")))
+
+NStacked = ggplot(dataLongN, aes(x=dataLongN$yearnum,y=dataLongN$MassN,fill=dataLongN$Pool))+geom_area(position='stack')
+print(NStacked + xlab("Year") + ylab("Mass N (mg/cm3 in top 30 cm)") +
+        ggtitle(strSite[s]) +
+        geom_hline(yintercept=NInit, linetype="dashed", color = "black") +
+        scale_fill_manual(values=StackedCol,
+                          name="Pool",
+                          labels=c("SOMp","SOMc","SOMa","MICr","MICk","LITm","LITs","InorgN")))
+
+NsourceStacked = ggplot(dataLongNsource, aes(x=dataLongNsource$yearnum,y=dataLongNsource$MassN,fill=dataLongNsource$Pool))+geom_area(position='stack')
+print(NsourceStacked + xlab("Year") + ylab("Rate of N transfer to microbial pool (mg/cm3-hr in top 30 cm)") +
+        ggtitle(strSite[s]) +
+        scale_fill_manual(values=StackedCol2,
+                          name="Pool",
+                          labels=c("SOM-K","Struc-K","Met-K","SOM-r","Struc-r","Met-r")))
+########
+
+par(mfrow=c(3,1), mar=c(1,1,1,1))
+plot(yearnum,  LIT[1,], lwd=3, ylim=c(min(LIT)*0.7, max(LIT))*1.15, type ="l", xlab="", main = paste(strSite[s]))
+lines(yearnum, LIT[2,], lwd=3, col = 2)
+legend("topright", legend=c("Met","Struc"), col=c(1,2), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+
+plot(yearnum,  MIC[1,], lwd=3, type ="l", xlab="", ylim=c(min(MIC)*0.7, max(MIC))*1.15)
+lines(yearnum, MIC[2,], lwd=3, col = 2)
+legend("topright", legend=c("Mic_r","Mic_K"), col=c(1,2), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+
+plot(yearnum,  SOM[1,], lwd=3, type ="l", ylim=c(min(SOM)*0.7, max(SOM))*1.15)
+lines(yearnum, SOM[2,], lwd=3, col = 2)
+lines(yearnum, SOM[3,], lwd=3, col = 4)
+legend("topright", legend=c("Phys","Chem","Avail"), col=c(1,2,4), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+
+par(mfrow=c(4,1), mar=c(1,1,1,1))
+plot(yearnum,  LITN[1,], lwd=3, ylim=c(min(LITN)*0.7, max(LITN))*1.15, type ="l", xlab="", main = paste(strSite[s]," N"))
+lines(yearnum, LITN[2,], lwd=3, col = 2)
+legend("topright", legend=c("Met","Struc"), col=c(1,2), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+
+plot(yearnum,  MICN[1,], lwd=3, type ="l", xlab="", ylim=c(min(MICN)*0.7, max(MICN))*1.15)
+lines(yearnum, MICN[2,], lwd=3, col = 2)
+legend("topright", legend=c("Mic_r","Mic_K"), col=c(1,2), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+
+plot(yearnum,  SOMN[1,], lwd=3, type ="l", ylim=c(0, max(SOMN))*1.15)
+lines(yearnum, SOMN[2,], lwd=3, col = 2)
+lines(yearnum, SOMN[3,], lwd=3, col = 4)
+lines(yearnum, InorgN[1,], lwd=3, col = 6)
+legend("topright", legend=c("Phys","Chem","Avail","Inorg N"), col=c(1,2,4,6), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+
+plot(yearnum,  InorgN[1,], lwd=3, type ="l", ylim=c(0, max(InorgN))*1.15)
+lines(yearnum, LLoss[1,], lwd=3, col = 4)
+legend("topright", legend=c("DIN","Leaching loss"), col=c(1,4), lty = 1,
+       lwd = 3, cex=1.3, bty="n")
+}
+```
+
+
+### Function to output steady state:
+```{r}
+outputSteadyState <- function(){
+    LIT_1    <<- test[[1]][[1]]
+    LIT_2    <<- test[[1]][[2]]
+    MIC_1    <<- test[[1]][[3]]
+    MIC_2    <<- test[[1]][[4]]
+    SOM_1    <<- test[[1]][[5]]
+    SOM_2    <<- test[[1]][[6]]
+    SOM_3    <<- test[[1]][[7]]
+
+    LIT_1_N    <<- test[[1]][[8]]
+    LIT_2_N    <<- test[[1]][[9]]
+    MIC_1_N    <<- test[[1]][[10]]
+    MIC_2_N    <<- test[[1]][[11]]
+    SOM_1_N    <<- test[[1]][[12]]
+    SOM_2_N    <<- test[[1]][[13]]
+    SOM_3_N    <<- test[[1]][[14]]
+    DIN        <<- test[[1]][[15]]
+    Site <<- strSite[s]
+    
+    #Carbon fluxes
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #Flows to and from MIC_1
+    LITmin[1] = MIC_1 * VMAX[1] * LIT_1 / (KM[1] + LIT_1)   #MIC_1 decomp of MET lit
+    LITmin[2] = MIC_1 * VMAX[2] * LIT_2 / (KM[2] + LIT_2)   #MIC_1 decomp of STRUC lit
+    SOMmin[1] = MIC_1 * VMAX[3] * SOM_3 / (KM[3] + SOM_3)   #decomp of SOMa by MIC_1
+    LITmin[3] = MIC_2 * VMAX[4] * LIT_1 / (KM[4] + LIT_1)   #decomp of MET litter
+    LITmin[4] = MIC_2 * VMAX[5] * LIT_2 / (KM[5] + LIT_2)   #decomp of SRUCTURAL litter
+    SOMmin[2] = MIC_2 * VMAX[6] * SOM_3 / (KM[6] + SOM_3)   #decomp of SOMa by MIC_2
+    
+    #Nitrogen fluxes
+    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #Flows to and from MIC_1
+    LITminN[1] =  LITmin[1]*LIT_1_N/(LIT_1+1e-100)#LITmin[1]/CN_m
+    LITminN[2] =  LITmin[2]*LIT_2_N/(LIT_2++1e-100)#LITmin[2]/CN_s
+    SOMminN[1] =  SOMmin[1]*(SOM_3_N/(SOM_3++1e-100))#SOMmin[1]*(SOM_3_N/SOM_3)#*relRateN
+    LITminN[3] =  LITmin[3]*LIT_1_N/(LIT_1+1e-100)#LITmin[3]/CN_m
+    LITminN[4] =  LITmin[4]*LIT_2_N/(LIT_2+1e-100)#LITmin[4]/CN_s
+    SOMminN[2] =  SOMmin[2]*(SOM_3_N/(SOM_3+1e-100))#SOMmin[2]*(SOM_3_N/SOM_3)#*relRateN
+    DINup[1]   = (1-Nleak)*DIN*MIC_1/(MIC_1+MIC_2+1e-100) #Partitions available DIN between microbial pools based on relative biomass
+    DINup[2]   = (1-Nleak)*DIN*MIC_2/(MIC_1+MIC_2+1e-100)
+  
+    #####
+    upMIC_1    = CUE[1]*(LITmin[1] + SOMmin[1]) + CUE[2]*(LITmin[2])
+    upMIC_1_N  = NUE*(LITminN[1] + SOMminN[1]) + NUE*(LITminN[2]) + DINup[1]
+    CNup[1]    = (upMIC_1)/(upMIC_1_N+1e-100) #Trying to optimize run speed here by avoiding /0
+    Overflow[1] = (upMIC_1) - (upMIC_1_N)*min(CN_r, CNup[1])
+    Nspill[1]   = (upMIC_1_N) - (upMIC_1)/max(CN_r, CNup[1])
+  
+    upMIC_2    = CUE[3]*(LITmin[3] + SOMmin[2]) + CUE[4]*(LITmin[4])
+    upMIC_2_N  = NUE*(LITminN[3] + SOMminN[2]) + NUE*(LITminN[4]) + DINup[2]
+    CNup[2]    = (upMIC_2)/(upMIC_2_N+1e-100)
+    Overflow[2] = (upMIC_2) - (upMIC_2_N)*min(CN_K, CNup[2])
+    Nspill[2]   = (upMIC_2_N) - (upMIC_2)/max(CN_K, CNup[2])
+    ######
+    
+    dLIT_1 = Inputs[1]*(1-FI[1]) - LITmin[1] - LITmin[3]
+    dLIT_2 = Inputs[2]*(1-FI[2]) - LITmin[2] - LITmin[4]
+    dMIC_1 = CUE[1]*(LITmin[1] + SOMmin[1]) + CUE[2]*(LITmin[2]) - sum(MICtrn[1:3]) - Overflow[1]
+    dMIC_2 = CUE[3]*(LITmin[3] + SOMmin[2]) + CUE[4]*(LITmin[4]) - sum(MICtrn[4:6]) - Overflow[2] 
+    dSOM_1 = Inputs[1]*FI[1] + MICtrn[1] + MICtrn[4] - DEsorb 
+    dSOM_2 = Inputs[2]*FI[2] + MICtrn[2] + MICtrn[5] - OXIDAT
+    dSOM_3 = MICtrn[3] + MICtrn[6] + DEsorb + OXIDAT - SOMmin[1] - SOMmin[2]
+
+    dLIT_1_N = Inputs[1]*(1-FI[1])/CN_m - LITminN[1] - LITminN[3]
+    dLIT_2_N = Inputs[2]*(1-FI[2])/CN_s - LITminN[2] - LITminN[4]
+    dMIC_1_N = NUE*(LITminN[1] + SOMminN[1]) + NUE*(LITminN[2]) - sum(MICtrnN[1:3]) + DINup[1] - Nspill[1]
+    dMIC_2_N = NUE*(LITminN[3] + SOMminN[2]) + NUE*(LITminN[4]) - sum(MICtrnN[4:6]) + DINup[2] - Nspill[2]
+    dSOM_1_N = Inputs[1]*FI[1]/CN_m + MICtrnN[1] + MICtrnN[4] - DEsorbN
+    dSOM_2_N = Inputs[2]*FI[2]/CN_s + MICtrnN[2] + MICtrnN[5] - OXIDATN
+    dSOM_3_N = MICtrnN[3] + MICtrnN[6] + DEsorbN + OXIDATN - SOMminN[1] - SOMminN[2]
+    
+    dDIN = (1-NUE)*(LITminN[1] + LITminN[2] + SOMminN[1]) +  #Inputs from r decomp
+      (1-NUE)*(LITminN[3] + LITminN[4] + SOMminN[2]) +  #Inputs from K decomp
+      Nspill[1] + Nspill[2] - DINup[1] - DINup[2]    #Uptake to microbial pools and spillage
+    LeachingLoss = Nleak*DIN
+    dDIN = dDIN-LeachingLoss #N leaching losses    
+    
+  Resp=(1-CUE[1])*(LITmin[1]+ SOMmin[1]) + (1-CUE[2])*(LITmin[2]) +
+    (1-CUE[3])*(LITmin[3]+ SOMmin[2]) + (1-CUE[4])*(LITmin[4]) + Overflow[1] + Overflow[2]
+  NminTot=(1-NUE)*(LITminN[1] + LITminN[2] + SOMminN[1]) +  #Inputs from r decomp
+    (1-NUE)*(LITminN[3] + LITminN[4] + SOMminN[2]) +  #Inputs from K decomp
+    Nspill[1] + Nspill[2]
+  NminNet=NminTot-DINup[1]-DINup[2]
+  
+  newrow <<- cbind.data.frame(Site, MIC_1,MIC_2,LIT_1,LIT_2,SOM_1,SOM_2,SOM_3,
+                 MIC_1_N,MIC_2_N,LIT_1_N,LIT_2_N,SOM_1_N,SOM_2_N,SOM_3_N,DIN, 
+                 NminTot,NminNet,Resp,
+                 stringsAsFactors = FALSE)
+  SSoutput[s,] <<- newrow
+}
+```
+
+
+### Function to output histogram data
+```{r}
+histogramOutput<-function(){
+  Study=".MIMICS-CN"
+  Site=SSoutput[s,1]
+  SOCabs=sum(SSoutput[s,6:8])
+  SONabs=sum(SSoutput[s,13:15])
+  MBCabs=sum(SSoutput[s,2:3])
+  MBNabs=sum(SSoutput[s,9:10])
+  SOC=sum(SSoutput[s,6:8])/15
+  SON=sum(SSoutput[s,13:15])/15
+  MBC=sum(SSoutput[s,2:3])/15
+  MBN=sum(SSoutput[s,9:10])/15
+  MBCperc=MBC/SOC*100
+  MBNperc=MBN/SON*100
+  SoilCN=SOC/SON
+  DIN=SSoutput[s,16]
+  Resp=SSoutput[s,18]
+  NminNet=SSoutput[s,19]
+    
+  siteData<<-cbind.data.frame(Study,Site,SOCabs,SONabs,MBCabs,MBNabs,SOC,SON,MBC,MBN,
+                              MBCperc,MBNperc,SoilCN,
+                              DIN,Resp,NminNet,stringsAsFactors=FALSE)
+  colnames(siteData)=colnames(histogramData)
+  histogramData<<-rbind(histogramData, siteData)
+}
+```
+
+
+### Function to plot histogram data
+```{r}
+plotHistograms<-function(){
+    
+    histObs <<- subset(histogramData, Study != ".MIMICS-CN")
+    histMIMICS <<- subset(histogramData, Study == ".MIMICS-CN")
+    
+    medSOC_OBS=median(na.omit(histObs$SOC))
+    medSON_OBS=median(na.omit(histObs$SON))
+    medMBC_OBS=median(na.omit(histObs$MBC))
+    medMBN_OBS=median(na.omit(histObs$MBN))
+    medMBCperc_OBS=median(na.omit(histObs$MBC.as...of.soil.C))
+    medMBNperc_OBS=median(na.omit(histObs$MBN.as...of.soil.N))
+    medSoilCN_OBS=median(na.omit(histObs$Soil.C.N))
+    
+    medSOC_MIM=median(histMIMICS$SOC)
+    medSON_MIM=median(histMIMICS$SON)
+    medMBC_MIM=median(histMIMICS$MBC)
+    medMBN_MIM=median(histMIMICS$MBN)
+    medMBCperc_MIM=median(histMIMICS$MBC.as...of.soil.C)
+    medMBNperc_MIM=median(histMIMICS$MBN.as...of.soil.N)
+    medSoilCN_MIM=median(histMIMICS$Soil.C.N)
+
+#Print plots below R notebook chunk
+print(ggplot(histogramData,aes(x=`Soil.C..mg.cm3..`, fill=Study)) + geom_density(alpha=0.25) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x)))  + 
+  labs(x = "Soil organic carbon (mg/cm3)"))
+
+print(ggplot(histogramData,aes(x=`Soil.N..mg.cm3..`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Soil organic nitrogen (mg/cm3)"))
+
+print(ggplot(histogramData,aes(x=`Microbial.biomass.C..mg.cm3.`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Microbial biomass carbon (mg/cm3)"))
+
+print(ggplot(histogramData,aes(x=`Microbial.biomass.N..mg.cm3.`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Microbial biomass nitrogen (mg/cm3)"))
+    
+print(ggplot(histogramData,aes(x=`Inorganic.nitrogen..ug.cm3.`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Inorganic nitrogen (ug/cm3)"))
+
+print(ggplot(histogramData,aes(x=`Respiration..ug.C.cm3.hr.`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Respiration (ug C/cm3*hr)"))
+
+print(ggplot(histogramData,aes(x=`Net.N.mineralization..ug.cm3.hr.`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Net N mineralization (ug N/cm3*hr)"))
+
+############
+    
+print(ggplot(histogramData,aes(x=`SOC`, fill=Study)) + geom_density(alpha=0.25) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x)))  + 
+  labs(x = "Soil organic carbon (% by mass)") +
+  geom_vline(xintercept=(medSOC_MIM))+
+  geom_vline(xintercept=(medSOC_OBS)))
+
+print(ggplot(histogramData,aes(x=`SON`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Soil organic nitrogen (% by mass)")+
+  geom_vline(xintercept=(medSON_MIM))+
+  geom_vline(xintercept=(medSON_OBS)))
+
+print(ggplot(histogramData,aes(x=`MBC`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Microbial biomass carbon (% by mass)")+
+  geom_vline(xintercept=(medMBC_MIM))+
+  geom_vline(xintercept=(medMBC_OBS)))
+
+print(ggplot(histogramData,aes(x=`MBN`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Microbial biomass nitrogen (% by mass)")+
+  geom_vline(xintercept=(medMBN_MIM))+
+  geom_vline(xintercept=(medMBN_OBS)))
+
+print(ggplot(histogramData,aes(x=`MBC.as...of.soil.C`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Microbial biomass C as a % of soil C")+
+  geom_vline(xintercept=(medMBCperc_MIM))+
+  geom_vline(xintercept=(medMBCperc_OBS)))
+
+print(ggplot(histogramData,aes(x=`MBN.as...of.soil.N`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Microbial biomass N as a % of soil N")+
+  geom_vline(xintercept=(medMBNperc_MIM))+
+  geom_vline(xintercept=(medMBNperc_OBS)))
+
+print(ggplot(histogramData,aes(x=`Soil.C.N`, fill=Study)) + geom_density(alpha=0.25)+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = trans_format("log10", math_format(10^.x))) + 
+  labs(x = "Soil C:N")+
+  geom_vline(xintercept=(medSoilCN_MIM))+
+  geom_vline(xintercept=(medSoilCN_OBS))+
+  scale_fill_manual(values=c("#F8766D", "#A3A500", "#00BF7D", "#00B0F6", "#E76BF3")))
+  
+
+#Output plots as PDFs
+fout          <- c('Display_Items/Histograms.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=8, height=8)    
+
+histColors=c("#F8766D", "#A3A500", "#00BF7D", "#00B0F6", "#E76BF3")
+
+p1 = ggplot(histogramData,aes(x=`SOC`, fill=Study)) + geom_density(alpha=0.25) +
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 0.01))+#trans_format("log10", math_format(10^.x)))  + 
+          labs(x = "Soil organic carbon (% by mass)") +
+          geom_vline(xintercept=(medSOC_MIM),col=2)+
+          geom_vline(xintercept=(medSOC_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p2 = ggplot(histogramData,aes(x=`SON`, fill=Study)) + geom_density(alpha=0.25)+
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 0.01))+#trans_format("log10", math_format(10^.x))) + 
+          labs(x = "Soil organic nitrogen (% by mass)")+
+          geom_vline(xintercept=(medSON_MIM),col=2)+
+          geom_vline(xintercept=(medSON_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p3 = ggplot(histogramData,aes(x=`MBC`, fill=Study)) + geom_density(alpha=0.25)+
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 0.0001))+#trans_format("log10", math_format(10^.x))) + 
+          labs(x = "Microbial biomass carbon (% by mass)")+
+          geom_vline(xintercept=(medMBC_MIM),col=2)+
+          geom_vline(xintercept=(medMBC_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p4 = ggplot(histogramData,aes(x=`MBN`, fill=Study)) + geom_density(alpha=0.25)+
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 0.0001))+#trans_format("log10", math_format(10^.x))) + 
+          labs(x = "Microbial biomass nitrogen (% by mass)")+
+          geom_vline(xintercept=(medMBN_MIM),col=2)+
+          geom_vline(xintercept=(medMBN_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p5 = ggplot(histogramData,aes(x=`MBC.as...of.soil.C`, fill=Study)) + geom_density(alpha=0.25)+
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 0.1))+#trans_format("log10", math_format(10^.x))) + 
+          labs(x = "Microbial biomass C as a % of soil C")+
+          geom_vline(xintercept=(medMBCperc_MIM),col=2)+
+          geom_vline(xintercept=(medMBCperc_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p6 = ggplot(histogramData,aes(x=`MBN.as...of.soil.N`, fill=Study)) + geom_density(alpha=0.25)+
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 0.1))+#trans_format("log10", math_format(10^.x))) + 
+          labs(x = "Microbial biomass N as a % of soil N")+
+          geom_vline(xintercept=(medMBNperc_MIM),col=2)+
+          geom_vline(xintercept=(medMBNperc_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p7 = ggplot(histogramData,aes(x=`Soil.C.N`, fill=Study)) + geom_density(alpha=0.25)+
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 1))+#trans_format("log10", math_format(10^.x))) + 
+          labs(x = "Soil C:N")+
+          geom_vline(xintercept=(medSoilCN_MIM),col=2)+
+          geom_vline(xintercept=(medSoilCN_OBS))+
+          guides(fill=FALSE)+
+          scale_fill_manual(values=histColors)+ 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+pBlank = ggplot(histogramData,aes(x=`SOC`, fill=Study)) + geom_density(alpha=0.25) +
+          scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+          labels = number_format(accuracy = 1))+#trans_format("log10", math_format(10^.x)))  + 
+          labs(x = "Soil organic carbon (% by mass)") +
+          geom_vline(xintercept=(medSOC_MIM),col=2)+
+          geom_vline(xintercept=(medSOC_OBS))+
+          scale_fill_manual(values=histColors) + 
+          theme(panel.grid.major = element_blank(), 
+                panel.grid.minor = element_blank())
+
+p8 = get_legend(pBlank)
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, nrow = 4, ncol=2)
+
+dev.off()
+
+}
+```
+
+
+### Function to run the litterbag addition experiments
+```{r}
+runLitterbags<-function(){
+  
+    nday   <<- 365 * (max(obsyear)) + 200
+    daynum    <<- seq(1,nday,1)
+    yearnum   <<- (daynum-143)/365
+    doy    <- 1
+    
+    #initialize arrays to store daily output data
+    LIT    <<- array(NA, dim = c(2,nday))
+    MIC    <<- array(NA, dim = c(2,nday))
+    SOM    <<- array(NA, dim = c(3,nday))
+    LITN   <<- array(NA, dim = c(2,nday))
+    MICN   <<- array(NA, dim = c(2,nday))
+    SOMN   <<- array(NA, dim = c(3,nday))
+    InorgN    <<- array(NA, dim = c(1,nday))
+    
+    #initialize litterbag arrays to store daily output data
+    TLIT    <<- array(NA, dim = c(6,2,nday))
+    TMIC    <<- array(NA, dim = c(6,2,nday))
+    TSOM    <<- array(NA, dim = c(6,3,nday))
+    TLITN   <<- array(NA, dim = c(6,2,nday))
+    TMICN   <<- array(NA, dim = c(6,2,nday))
+    TSOMN   <<- array(NA, dim = c(6,3,nday))
+    TInorgN    <<- array(NA, dim = c(6,1,nday))
+    
+    for( i in 1:6)     {    #SPEEDS search
+      doy <- 1
+      #initialize pools
+      LIT_1    <- test[[1]][[1]]
+      LIT_2    <- test[[1]][[2]]
+      MIC_1    <- test[[1]][[3]]
+      MIC_2    <- test[[1]][[4]]
+      SOM_1    <- test[[1]][[5]]
+      SOM_2    <- test[[1]][[6]]
+      SOM_3    <- test[[1]][[7]]
+
+      LIT_1_N    <- test[[1]][[8]]
+      LIT_2_N    <- test[[1]][[9]]
+      MIC_1_N    <- test[[1]][[10]]
+      MIC_2_N    <- test[[1]][[11]]
+      SOM_1_N    <- test[[1]][[12]]
+      SOM_2_N    <- test[[1]][[13]]
+      SOM_3_N    <- test[[1]][[14]]
+      DIN        <- test[[1]][[15]]
+      
+      #bag pools - need to start at 0
+      TLIT_1    <- 0
+      TLIT_2    <- 0
+      TMIC_1    <- 0
+      TMIC_2    <- 0
+      TSOM_1    <- 0
+      TSOM_2    <- 0
+      TSOM_3    <- 0
+      
+      TLIT_1_N    <- 0
+      TLIT_2_N    <- 0
+      TMIC_1_N    <- 0
+      TMIC_2_N    <- 0
+      TSOM_1_N    <- 0
+      TSOM_2_N    <- 0
+      TSOM_3_N    <- 0
+      TDIN        <- 0
+      
+      poolValues  <- c(LIT_1 = LIT_1, LIT_2 = LIT_2, 
+              MIC_1 = MIC_1, MIC_2 = MIC_2, 
+              SOM_1 = SOM_1, SOM_2 = SOM_2, SOM_3 = SOM_3,
+              LIT_1_N = LIT_1_N, LIT_2_N = LIT_2_N, 
+              MIC_1_N = MIC_1_N, MIC_2_N = MIC_2_N, 
+              SOM_1_N = SOM_1_N, SOM_2_N = SOM_2_N, SOM_3_N = SOM_3_N,
+              DIN = DIN,
+              TLIT_1 = TLIT_1, TLIT_2 = TLIT_2, 
+              TMIC_1 = TMIC_1, TMIC_2 = TMIC_2, 
+              TSOM_1 = TSOM_1, TSOM_2 = TSOM_2, TSOM_3 = TSOM_3,
+              TLIT_1_N = TLIT_1_N, TLIT_2_N = TLIT_2_N, 
+              TMIC_1_N = TMIC_1_N, TMIC_2_N = TMIC_2_N, 
+              TSOM_1_N = TSOM_1_N, TSOM_2_N = TSOM_2_N, TSOM_3_N = TSOM_3_N,
+              TDIN = TDIN)
+
+        tracePars <<- c(Inputs = Inputs, VMAX = VMAX, KM = KM, CUE = CUE, 
+              fPHYS = fPHYS, fCHEM = fCHEM, fAVAI = fAVAI, FI = FI, 
+              turnover = turnover, LITmin = LITmin, SOMmin = SOMmin, MICtrn = MICtrn, 
+              desorb = desorb, DEsorb = DEsorb, OXIDAT = OXIDAT,
+              LITminN = LITminN, SOMminN = SOMminN, MICtrnN = MICtrnN,
+              DEsorbN = DEsorbN, OXIDATN = OXIDATN,
+              KO = KO,
+              CNup=CNup, DINup=DINup,Nspill=Nspill, Overflow=Overflow, 
+              upMIC_1=upMIC_1, upMIC_1_N=upMIC_1_N,
+              upMIC_2=upMIC_2, upMIC_2_N=upMIC_2_N,
+              NUE=NUE, CN_m=CN_m, CN_s=CN_s, CN_r=CN_r, CN_K=CN_K,Nleak=Nleak, densDep=densDep,
+              TLITmin = TLITmin, TSOMmin = TSOMmin, TMICtrn = TMICtrn, 
+              TDEsorb = TDEsorb, TOXIDAT = TOXIDAT,
+              TLITminN = TLITminN, TSOMminN = TSOMminN, TMICtrnN = TMICtrnN,
+              TDEsorbN = TDEsorbN, TOXIDATN = TOXIDATN,
+              TCNup=TCNup, TDINup=TDINup,TNspill=TNspill, TOverflow=TOverflow, 
+              upTMIC_1=upTMIC_1, upTMIC_1_N=upTMIC_1_N,
+              upTMIC_2=upTMIC_2, upTMIC_2_N=upTMIC_2_N,
+              TNimport=TNimport, fracNImportr=fracNImportr,
+              fracNImportK=fracNImportK, LeachingLoss=LeachingLoss)
+
+      for (d in 1:nday)  {
+        for (h in 1:24)   {
+          
+        dpoolValues=TFXEQ(1, poolValues, tracePars)
+        dpoolValues=dpoolValues[[1]]
+        names(dpoolValues)=names(poolValues)
+        poolValues=poolValues+dpoolValues
+        
+        #write out daily results
+        if (h == 24) {
+        LIT[1,d] <<- poolValues[1]
+        LIT[2,d] <<- poolValues[2]
+        MIC[1,d] <<- poolValues[3]
+        MIC[2,d] <<- poolValues[4]
+        SOM[1,d] <<- poolValues[5]
+        SOM[2,d] <<- poolValues[6]
+        SOM[3,d] <<- poolValues[7]
+        
+        LITN[1,d] <<- poolValues[8]
+        LITN[2,d] <<- poolValues[9]
+        MICN[1,d] <<- poolValues[10]
+        MICN[2,d] <<- poolValues[11]
+        SOMN[1,d] <<- poolValues[12]
+        SOMN[2,d] <<- poolValues[13]
+        SOMN[3,d] <<- poolValues[14]
+        InorgN[1,d]<<-poolValues[15]
+        
+        #Bag results
+        if (diffNotTrace==FALSE){
+        TLIT[i,1,d] <<- poolValues[16]
+        TLIT[i,2,d] <<- poolValues[17]
+        TMIC[i,1,d] <<- poolValues[18]
+        TMIC[i,2,d] <<- poolValues[19]
+        TSOM[i,1,d] <<- poolValues[20]
+        TSOM[i,2,d] <<- poolValues[21]
+        TSOM[i,3,d] <<- poolValues[22]
+            
+        TLITN[i,1,d] <<- poolValues[23]
+        TLITN[i,2,d] <<- poolValues[24]
+        TMICN[i,1,d] <<- poolValues[25]
+        TMICN[i,2,d] <<- poolValues[26]
+        TSOMN[i,1,d] <<- poolValues[27]
+        TSOMN[i,2,d] <<- poolValues[28]
+        TSOMN[i,3,d] <<- poolValues[29]
+        TInorgN[i,1,d] <<- poolValues[30]
+        }
+
+        if(diffNotTrace==TRUE){
+        TLIT[i,1,d] <<- poolValues[1] - test[[1]][[1]]
+        TLIT[i,2,d] <<- poolValues[2] - test[[1]][[2]]
+        TMIC[i,1,d] <<- poolValues[3] - test[[1]][[3]]
+        TMIC[i,2,d] <<- poolValues[4] - test[[1]][[4]]
+        TSOM[i,1,d] <<- poolValues[5] - test[[1]][[5]]
+        TSOM[i,2,d] <<- poolValues[6] - test[[1]][[6]]
+        TSOM[i,3,d] <<- poolValues[7] - test[[1]][[7]]
+            
+        TLITN[i,1,d] <<- poolValues[8] - test[[1]][[8]]
+        TLITN[i,2,d] <<- poolValues[9] - test[[1]][[9]]
+        TMICN[i,1,d] <<- poolValues[10] - test[[1]][[10]]
+        TMICN[i,2,d] <<- poolValues[11] - test[[1]][[11]]
+        TSOMN[i,1,d] <<- poolValues[12] - test[[1]][[12]]
+        TSOMN[i,2,d] <<- poolValues[13] - test[[1]][[13]]
+        TSOMN[i,3,d] <<- poolValues[14] - test[[1]][[14]]
+        TInorgN[i,1,d] <<- poolValues[15] - test[[1]][[15]]
+        }
+
+        } #end daily writeout statement
+        
+          #add litter bag on Oct 1
+          if (d == 143)   {
+            if (h == 24)  {
+              poolValues["TLIT_1"]=BAG[i,1]
+              poolValues["TLIT_2"]=BAG[i,2]
+              poolValues["TLIT_1_N"]=poolValues["TLIT_1"]/CN_m
+              poolValues["TLIT_2_N"]=poolValues["TLIT_2"]/CN_s_BAG[i]
+              if (perturbUnderlying == TRUE){
+                poolValues["LIT_1"]=poolValues["LIT_1"]+BAG[i,1]
+                poolValues["LIT_2"]=poolValues["LIT_2"]+BAG[i,2]
+                poolValues["LIT_1_N"]=poolValues["LIT_1_N"]+BAG[i,1]/CN_m
+                poolValues["LIT_2_N"]=poolValues["LIT_2_N"]+BAG[i,2]/CN_s_BAG[i]
+              }
+              print(paste("------added litter",LITtype[i]))
+            }
+          }
+            
+        }#close hourly loop
+        
+          #advance day of year counter
+          if (doy == 365) {
+              doy <- 1
+            } else {
+              doy <- doy + 1
+            }                         #close day of year counter
+          }                                     #close daily loop
+      
+        print(paste(c("finished litter", LITtype[i])))
+        if (stackedExpFigs==TRUE){
+          StackedCol=c("#66ccff","#3399cc","#006699","#66ffcc","#009966","#ff6666","#cc3333","#ff9966")
+          StackedCol2=c("steelblue4","indianred4","rosybrown3","steelblue1","indianred3","rosybrown1")
+          
+          dfTC=data.frame(yearnum,
+                         TSOM[i,1,], TSOM[i,2,], TSOM[i,3,],
+                         TMIC[i,1,], TMIC[i,2,],
+                         TLIT[i,1,], TLIT[i,2,])
+          dataLongTC = melt(dfTC, id.vars="year",variable.name="Pool", value.name = "MassC")
+          CInit=TSOM[i,1,144]+TSOM[i,2,144]+TSOM[i,3,144]+TMIC[i,1,144]+TMIC[i,2,144]+TLIT[i,1,144]+TLIT[i,2,144]
+          CInitMin=TSOM[i,1,144]+TSOM[i,2,144]+TSOM[i,3,144]+TMIC[i,1,144]+TMIC[i,2,144]
+          
+          dfTN=data.frame(yearnum,
+                         TSOMN[i,1,], TSOMN[i,2,], TSOMN[i,3,],
+                         TMICN[i,1,], TMICN[i,2,],
+                         TLITN[i,1,], TLITN[i,2,],
+                         TInorgN[i,1,])
+          dataLongTN = melt(dfTN, id.vars="year",variable.name="Pool", value.name = "MassN")
+          NInit=TSOMN[i,1,144]+TSOMN[i,2,144]+TSOMN[i,3,144]+TMICN[i,1,144]+TMICN[i,2,144]+TLITN[i,1,144]+TLITN[i,2,144]+ TInorgN[i,1,144]
+          
+          
+          TCStacked = ggplot(dataLongTC, aes(x=dataLongTC$yearnum,y=dataLongTC$MassC,fill=dataLongTC$Pool))+geom_area(position='stack')
+          print(TCStacked + xlab("Year") + ylab("Mass C (mg/cm3 in top 30 cm)") +
+                  geom_hline(yintercept=CInit, linetype="dashed", color = "black") +
+                  scale_fill_manual(values=StackedCol,
+                                    name="Pool",
+                                    labels=c("SOMp","SOMc","SOMa","MICr","MICk","LITm","LITs")))
+          
+          TNStacked = ggplot(dataLongTN, aes(x=dataLongTN$yearnum,y=dataLongTN$MassN,fill=dataLongTN$Pool))+geom_area(position='stack')
+          print(TNStacked + xlab("Year") + ylab("Mass N (mg/cm3 in top 30 cm)") +
+                  geom_hline(yintercept=NInit, linetype="dashed", color = "black") +
+                  scale_fill_manual(values=StackedCol,
+                                    name="Pool",
+                                    labels=c("SOMp","SOMc","SOMa","MICr","MICk","LITm","LITs","InorgN")))
+        }
+    } #close loop through litter types
+}
+```
+
+
+### Function to plot stacked figures for litterbag aditions
+```{r}
+stackedLitterbagPlots = function(){
+
+  StackedCol=c("#66ccff","#3399cc","#006699","#66ffcc","#009966","#ff6666","#cc3333","#ff9966")
+  StackedCol2=c("steelblue4","indianred4","rosybrown3","steelblue1","indianred3","rosybrown1")
+  
+  dfTC=data.frame(yearnum,
+                 TSOM[i,1,], TSOM[i,2,], TSOM[i,3,],
+                 TMIC[i,1,], TMIC[i,2,],
+                 TLIT[i,1,], TLIT[i,2,])
+  dataLongTC = melt(dfTC, id.vars="year",variable.name="Pool", value.name = "MassC")
+  CInit=TSOM[i,1,144]+TSOM[i,2,144]+TSOM[i,3,144]+TMIC[i,1,144]+TMIC[i,2,144]+TLIT[i,1,144]+TLIT[i,2,144]
+  CInitMin=TSOM[i,1,144]+TSOM[i,2,144]+TSOM[i,3,144]+TMIC[i,1,144]+TMIC[i,2,144]
+  
+  dfTN=data.frame(yearnum,
+                 TSOMN[i,1,], TSOMN[i,2,], TSOMN[i,3,],
+                 TMICN[i,1,], TMICN[i,2,],
+                 TLITN[i,1,], TLITN[i,2,],
+                 TInorgN[i,1,])
+  dataLongTN = melt(dfTN, id.vars="year",variable.name="Pool", value.name = "MassN")
+  NInit=TSOMN[i,1,144]+TSOMN[i,2,144]+TSOMN[i,3,144]+TMICN[i,1,144]+TMICN[i,2,144]+TLITN[i,1,144]+TLITN[i,2,144]+ TInorgN[i,1,144]
+  
+  
+  fout          <- c('Display_Items/Stacked_Figures/stackedLitterbag_',as.character(LTERdata$Site[s]), '.pdf')
+  fout          <- paste(fout, collapse="")
+  pdf(fout, width=15, height=7)
+  par(mar=c(5,5,1,1), mfrow=c(1,2))
+  
+      TCStacked = ggplot(dataLongTC, aes(x=dataLongTC$yearnum,y=dataLongTC$MassC,fill=dataLongTC$Pool))+geom_area(position='stack')
+      print(TCStacked + xlab("Year") + ylab("Mass C (mg/cm3 in top 30 cm)") +
+              geom_hline(yintercept=CInit, linetype="dashed", color = "black") +
+              scale_fill_manual(values=StackedCol,
+                                name="Pool",
+                                labels=c("SOMp","SOMc","SOMa","MICr","MICk","LITm","LITs")))
+      
+      TNStacked = ggplot(dataLongTN, aes(x=dataLongTN$yearnum,y=dataLongTN$MassN,fill=dataLongTN$Pool))+geom_area(position='stack')
+      print(TNStacked + xlab("Year") + ylab("Mass N (mg/cm3 in top 30 cm)") +
+              geom_hline(yintercept=NInit, linetype="dashed", color = "black") +
+              scale_fill_manual(values=StackedCol,
+                                name="Pool",
+                                labels=c("SOMp","SOMc","SOMa","MICr","MICk","LITm","LITs","InorgN")))
+    
+  dev.off()
+  
+}
+```
+
+
+### Function to output the results of the litterbag aditions
+```{r}    
+outputLitterbags<-function(){
+  
+  #---------------Calculate averages across litter types--------------------------
+
+    allTLIT  <<- array(NA, dim=c(6,nday))
+    allTMIC  <<- array(NA, dim=c(6,nday))
+    allTSOM  <<- array(NA, dim=c(6,nday))
+    allTC     <<- array(NA, dim=c(6,nday))
+    maxTLIT  <<- array(NA, dim=c(6,nday))
+    TLITleft <<- array(NA, dim=c(6,nday), dimnames=list(LITtype,c(as.character(yearnum))))
+    allTCleft <<- array(NA, dim=c(6,nday), dimnames=list(LITtype,c(as.character(yearnum))))
+    allTLITN  <<- array(NA, dim=c(6,nday))
+    allTMICN  <<- array(NA, dim=c(6,nday))
+    allTSOMN  <<- array(NA, dim=c(6,nday))
+    allTN      <<- array(NA, dim=c(6,nday))
+    maxTLITN  <<- array(NA, dim=c(6,nday))
+    TLITNleft <<- array(NA, dim=c(6,nday), dimnames=list(LITtype,c(as.character(yearnum))))
+    allTNleft <<- array(NA, dim=c(6,nday), dimnames=list(LITtype,c(as.character(yearnum))))
+    
+    for (i in 1:6) {
+      allTLIT[i,]  <- colSums(TLIT[i,,])
+      maxTLIT      <- max(allTLIT[i,])
+      TLITleft[i,] <- 100* allTLIT[i,] / maxTLIT
+      
+      allTMIC[i,]  <- colSums(TMIC[i,,])
+      allTSOM[i,]  <- colSums(TSOM[i,,])
+      allTC[i,]= allTLIT[i,]+allTMIC[i,]+allTSOM[i,]
+      maxAllTC      <- max(allTC[i,])
+      allTCleft[i,]     <- 100* allTC[i,] / maxAllTC
+      
+      allTLITN[i,]  <- colSums(TLITN[i,,])
+      maxTLITN      <- max(allTLITN[i,])
+      TLITNleft[i,] <-  allTLITN[i,] / maxTLITN
+      
+      #Relativizing to the maximum doesn't make sense in the case of total N
+      #if you assume microbes can immobilize N. Therefore, I relativized to
+      #the total N at first point after the bag is added (144).
+      allTMICN[i,]  <- colSums(TMICN[i,,])
+      allTSOMN[i,]  <- colSums(TSOMN[i,,])
+      allTN[i,]= allTLITN[i,]+allTMICN[i,]+allTSOMN[i,]
+      allTNleft[i,]     <- allTN[i,] / allTN[i,144]
+      #The SOM pools should be empty at d 143 so it shouldn't matter which ones are included
+      #in the calculations of initial N, but this is still one of those places that I want to 
+      #make more precise/elegant/robust at some point. 
+    }
+    
+    TLITleft[1:6,1:143] <- NA
+    meanTLIT            <<- colMeans(TLITleft)
+    sdTLIT              <<- apply(TLITleft, 2, sd)
+    
+    allTCleft[1:6,1:143] <- NA
+    meanallTC            <<- colMeans(allTCleft)
+    sdallTC              <<- apply(allTCleft, 2, sd)
+    
+    TLITNleft[1:6,1:143] <- NA
+    meanTLITN            <<- colMeans(TLITNleft)
+    sdTLITN              <<- apply(TLITNleft, 2, sd)
+    
+    allTNleft[1:6,1:143] <- NA
+    meanallTN            <<- colMeans(allTNleft)
+    sdallTN              <<- apply(allTNleft, 2, sd)
+
+    #--------------Sample model @ observed time points------------------------------------
+    
+    for (y in 1:nobsyears) {
+      obsindex[y] <- which.min(abs(yearnum-obsyear[y]))
+    }
+
+    mimMASStierLIT = TLITleft[,obsindex]
+    mimMASStierTOT = allTCleft[,obsindex]
+    mimMASSNtierLIT = TLITNleft[,obsindex]
+    mimMASSNtierTOT = allTNleft[,obsindex]
+    
+    for (j in 1:6) {
+      for (y in 1:nobsyears) {
+        xyLIT[xyCount]  <<- LITtype[j]
+        xyTIME[xyCount] <<- obsyear[y]
+        xySITE[xyCount] <<- as.character(LTERdata$Site[s])
+        xyOBS[xyCount]  <<- obsMASS[j,y]
+        xyOBSN[xyCount]  <<- obsMASSN[j,y]
+        xyMIMLitC[xyCount]  <<- mimMASStierLIT[j,y]
+        xyMIMAllC[xyCount]  <<- mimMASStierTOT[j,y]
+        xyMIMLitN[xyCount]  <<- mimMASSNtierLIT[j,y]
+        xyMIMAllN[xyCount]  <<- mimMASSNtierTOT[j,y]
+        xyCount         <<- xyCount + 1
+      }
+    }
+}
+```
+
+
+### Function to plot the outcome of the litterbag additions
+```{r}
+plotLitterbags<-function(){
+    
+    #-------------Output plots and data matrices----------------------------------
+    tt <- c(meanTLIT+sdTLIT, rev(meanTLIT-sdTLIT))
+    uu <- c(meanallTC+sdallTC, rev(meanallTC-sdallTC))
+    vv <- c(meanTLITN+sdTLITN, rev(meanTLITN-sdTLITN))
+    ww <- c(meanallTN+sdallTN, rev(meanallTN-sdallTN))
+    xx <- c(yearnum, rev(yearnum))
+    
+    # #Litter pool carbon, tier 2
+     par(mfrow=c(1,1),mar=c(5,5.2,0,1))
+     plot(xx,tt, type="n", main=paste(strSite[s], "leaf decomp"), ylab="Mass remaining (%)",
+          xlab="time (y)", ylim=c(0,100), xlim=c(0.1,max(obsyear+0.15)),
+          cex.lab = 1.3, cex.axis = 1.2)
+     axis(side = 4, at = seq(0,100,20), labels = FALSE)
+     polygon(xx, tt, col="grey", border = NA)
+     lines(yearnum, meanTLIT, lwd=2)
+     points(obsyear,obsmass, pch=16, col=1, cex=1.3)
+     arrows(obsyear, obsmass + obsSD, obsyear, obsmass - obsSD, code = 3, angle = 90, length =0.05)
+    
+    #All pools carbon, tier 2
+    par(mfrow=c(1,1), mar=c(5,5.2,0,1))
+    plot(xx,uu, type="n", main=paste(strSite[s], "leaf decomp"), ylab="Mass remaining (%)",
+         xlab="time (y)", ylim=c(0,100), xlim=c(0.1,max(obsyear+0.15)),
+         cex.lab = 1.3, cex.axis = 1.2)
+    axis(side = 4, at = seq(0,100,20), labels = FALSE)
+    polygon(xx, uu, col="grey", border = NA)
+    lines(yearnum, meanallTC, lwd=2)
+    points(obsyear,obsmass, pch=16, col=1, cex=1.3)
+    arrows(obsyear, obsmass + obsSD, obsyear, obsmass - obsSD, code = 3, angle = 90, length =0.05)
+    
+    # #Litter pool nitrogen, tier 2
+     par(mar=c(5,5.2,0,1))
+     plot(xx,vv, type="n", main=paste(strSite[s], "leaf decomp"), ylab="Fraction initial N remaining",
+          xlab="time (y)", ylim=c(0,1.5), xlim=c(0.1,max(obsyear+0.15)),
+          cex.lab = 1.3, cex.axis = 1.2)
+     axis(side = 4, at = seq(0,2,20), labels = FALSE)
+     polygon(xx, vv, col="grey", border = NA)
+     lines(yearnum, meanTLITN, lwd=2)
+     points(obsyear,obsmassN, pch=16, col=1, cex=1.3)
+     arrows(obsyear, obsmassN + obsSDN, obsyear, obsmassN - obsSDN, code = 3, angle = 90, length =0.05)
+    
+    #All pools nitrogen,tier 2
+    par(mar=c(5,5.2,0,1))
+    
+    plot(xx,ww, type="n", main=paste(strSite[s], "leaf decomp"), ylab="Fraction initial N remaining",
+         xlab="time (y)", ylim=c(0,1.5), xlim=c(0.1,max(obsyear+0.15)),
+         cex.lab = 1.3, cex.axis = 1.2)
+    axis(side = 4, at = seq(0,2,20), labels = FALSE)
+    polygon(xx, ww, col="grey", border = NA)
+    lines(yearnum, meanallTN, lwd=2)
+    points(obsyear,obsmassN, pch=16, col=1, cex=1.3)
+    arrows(obsyear, obsmassN + obsSDN, obsyear, obsmassN - obsSDN, code = 3, angle = 90, length =0.05)
+}
+```
+
+
+### Function to plot HFR litterbag additions for final figure
+```{r}
+niceLitterbagPlot<-function(){
+
+    tt <- c(meanTLIT+sdTLIT, rev(meanTLIT-sdTLIT))
+    uu <- c(meanallTC+sdallTC, rev(meanallTC-sdallTC))
+    vv <- c(meanTLITN+sdTLITN, rev(meanTLITN-sdTLITN))
+    ww <- c(meanallTN+sdallTN, rev(meanallTN-sdallTN))
+    xx <- c(yearnum, rev(yearnum))
+    
+    fout          <- c('Display_Items/HFR Litterbag.pdf')
+    fout          <- paste(fout, collapse="")
+    pdf(fout, width=5, height=8)
+    
+    #All pools carbon, tier 2
+    par(mfrow=c(2,1), mar=c(1,5,1,1))
+    plot(xx,uu, type="n", ylab="C remaining (%)",
+         xlab="", 
+         xaxt='n',
+         ylim=c(0,100), xlim=c(0.1,max(obsyear+0.15)),
+         cex.lab = 1.3, cex.axis = 1.2)
+    text(10, 95,"(a)", cex=1.2)
+    polygon(xx, uu, col="grey", border = NA)
+    lines(yearnum, meanallTC, lwd=2)
+    points(obsyear,obsmass, pch=16, col=1, cex=1.3)
+    arrows(obsyear, obsmass + obsSD, obsyear, obsmass - obsSD, code = 3, angle = 90, length =0.05)
+    
+    #All pools nitrogen,tier 2
+    par(mar=c(5,5,1,1))
+    plot(xx,ww, type="n", ylab="Fraction initial N remaining",
+         xlab="time (y)", ylim=c(0,1.5), xlim=c(0.1,max(obsyear+0.15)),
+         cex.lab = 1.3, cex.axis = 1.2)
+    text(10, 1.45,"(b)", cex=1.2)
+    polygon(xx, ww, col="grey", border = NA)
+    lines(yearnum, meanallTN, lwd=2)
+    points(obsyear,obsmassN, pch=16, col=1, cex=1.3)
+    arrows(obsyear, obsmassN + obsSDN, obsyear, obsmassN - obsSDN, code = 3, angle = 90, length =0.05)
+    
+    dev.off()
+}
+```
+
+
+### Function to plot 6-panel figure with various SS fractions relationships
+```{r}
+fractions6panelPlot<-function(){
+
+attach(LTERdata)  
+MATtall = rep(MAT,times=3)
+LIGtall = rep(LIG,times=3)
+attach(SSoutput)
+SOMPool = c(rep("SOMp",times=14),rep("SOMc",times=14),rep("SOMa",times=14))
+SOMamount = c(SOMp,SOMc,SOMa)
+FractionsBarPlot = data.frame(MATtall,LIGtall,SOMPool,SOMamount)
+
+ANPP.CLAY2 = ANPP*CLAY2	
+SoilCN = (MICr+MICK+LITm+LITs+SOMp+SOMc+SOMa)/(MICrN+MICKN+LITmN+LITsN+SOMpN+SOMcN+SOMaN+InorgN)
+FractionsFigure = data.frame(SSoutput,LTERdata,ANPP.CLAY2,SoilCN)
+
+unevenBars = ggplot(FractionsBarPlot, aes(fill=SOMPool, y=SOMamount, x=MATtall)) + 
+  geom_bar(position="stack", stat="identity",width=0.8) + 
+  scale_fill_manual(values=c("#F8766D","#00BA38","#619CFF"))+
+  theme(legend.position = c(0.25, 0.8)) + 
+  labs(x = "Mean annual temperature (degrees C)") +
+  labs(y = expression('Total soil carbon (mg C cm'^'-3'*')'))+
+  #geom_text(aes(x=-10,y=50,label="(a)"))
+  annotate("text",x=-10,y=50,label="(a)")
+  
+stackedBars = ggplot(FractionsBarPlot, aes(fill=SOMPool, y=SOMamount, x=MATtall)) + 
+  geom_bar(position="fill", stat="identity",width=0.8,show.legend=FALSE)+ 
+  labs(x = "Mean annual temperature (degrees C)") +
+  labs(y = "Fraction of total soil C")+
+  #geom_text(aes(x=-10,y=1,label="(b)"))
+  annotate("text",x=-10,y=1,label="(b)")
+
+r2A=signif(summary(lm(ANPP.CLAY2~SOMp))[[8]], digits=2)
+SOMpCor = ggplot(FractionsFigure, aes(x=ANPP.CLAY2, y=SOMp))+
+  geom_point(col="#619CFF") + 
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE,col="#619CFF")+ 
+  labs(x = "Product of ANPP and clay content") +
+  labs(y = expression('Physicochemically-protected soil C (mg C cm'^'-3'*')'))+
+  geom_text(aes(label = paste("R^2: ",r2A,sep="")),parse=T,x=20000,y=20, show_guide=F,col="#619CFF")+
+  #geom_text(aes(x=0,y=50,label="(c)"))
+  annotate("text",x=0,y=50,label="(c)")
+
+r2B=signif(summary(lm(MAT~SOMa))[[8]], digits=2)
+r2C=signif(summary(lm(MAT~SOMc))[[8]], digits=2)
+SOMMATCor = ggplot(subset(FractionsBarPlot,SOMPool!="SOMp"), 
+  aes(x=MATtall, y=SOMamount, col=SOMPool))+
+  scale_colour_manual(values=c("#F8766D","#00BA38","#619CFF"))+
+  geom_point(show.legend=FALSE) + 
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE) + 
+  theme(legend.position = c(0.25, 0.8)) + 
+  labs(x = "Mean annual temperature (degrees C)") +
+  labs(y = expression('Soil C (mg C cm'^'-3'*')'))+
+  #geom_text(aes(x=-10,y=15,label="(d)"))+
+  annotate("text",x=-10,y=15,label="(d)")+
+  geom_text(aes(label = paste("R^2: ",r2B,sep="")),parse=T,x=-2,y=2, show_guide=F,col="#F8766D")+
+  geom_text(aes(label = paste("R^2: ",r2C,sep="")),parse=T,x=15,y=5, show_guide=F,col="#00BA38")
+
+r2D=signif(summary(lm(LIG~SOMa))[[8]], digits=2)
+r2E=signif(summary(lm(LIG~SOMc))[[8]], digits=2)
+SOMLIGCor = ggplot(subset(FractionsBarPlot,SOMPool!="SOMp"), 
+  aes(x=LIGtall, y=SOMamount,col=SOMPool,show.legend=FALSE))+
+  scale_colour_manual(values=c("#F8766D","#00BA38","#619CFF"))+
+  geom_point(show.legend=FALSE) + 
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE,show.legend=FALSE) + 
+  labs(x = "Litter lignin content (%)") +
+  labs(y = expression('Soil C (mg C cm'^'-3'*')'))+
+  #geom_text(aes(x=15,y=15,label="(e)"))+
+  annotate("text",x=15,y=15,label="(e)")+
+  geom_text(aes(label = paste("R^2: ",r2D,sep="")),parse=T,x=23,y=1.5, show_guide=F,col="#F8766D")+
+  geom_text(aes(label = paste("R^2: ",r2E,sep="")),parse=T,x=18,y=6, show_guide=F,col="#00BA38")
+
+r2F=signif(summary(lm(SOMp~SoilCN))[[8]], digits=2)
+SOMpvCN = ggplot(FractionsFigure, aes(x=SOMp, y=SoilCN))+
+  geom_point(col="#619CFF") + 
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE,col="#619CFF")+ 
+  labs(x = expression('Physicochemically-protected soil C (mg C cm'^'-3'*')')) +
+  labs(y = "Soil C:N") +
+  geom_text(aes(label = paste("R^2: ",r2F,sep="")),parse=T,x=18,y=10.5, show_guide=F,col="#619CFF")+
+  #geom_text(aes(x=0.1,y=13,label="(f)"))
+  annotate("text",x=0.1,y=13,label="(f)")
+
+fout          <- c('Display_Items/Fractions6PanelFigure.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=12, height=8)
+par(mar=c(5,5,1,1), mfrow=c(2,2))
+
+grid.arrange(unevenBars, stackedBars, SOMpCor, SOMMATCor, SOMLIGCor, SOMpvCN, ncol = 3, 
+             layout_matrix = rbind(c(1,2,3), c(4,5,6)))
+
+dev.off()
+}
+```  
+
+
+## Executable LIDET site loop - for all sites except HFR
+```{r}
+valiSites=c(1,2,3,4,5,7,8,9,10,11,12,13,14)
+for(s in valiSites){
+  #Find steady state solution, plot to examine and output values to table
+  readLIDETObservations() 
+  siteSpecificParameters()
+  initializePools()
+  findSteadyState()
+  if(SSPlots==TRUE){
+    plotSteadyState()
+  }
+  outputSteadyState()
+  histogramOutput()
+  
+  #Litterbag addition experiments
+  if(experiments==TRUE){
+    initializeTracerPools()
+    runLitterbags()
+    outputLitterbags()
+    plotLitterbags()
+  }
+} #finish site loop
+
+#output steady state data to table
+data_out <<- SSoutput
+fout  <<- 'MIMICS_SSoutput.csv'
+write.table(data_out, file=fout, sep=",", col.names=TRUE, row.names=FALSE)
+plotHistograms()
+fractions6panelPlot()
+```
+
+
+## LIDET output summary figures
+If you run the script for the entire set of 14 sites, you can run this script to look at the predicted vs. observed values for C and N across the entire dataset:
+```{r}
+if (experiments == TRUE){
+
+DAYCENT =FALSE#TRUE  #Set this to TRUE to get results from DAYCENT
+if(DAYCENT==TRUE){
+  remove(list=ls())
+  DAYCENTdata <<- read.csv("DAYCENT_LIDET_all_trimmed.csv")
+  DAYCENTdata <<- subset(DAYCENTdata, DAYCENTdata$xySITE!="HFR")
+  names(DAYCENTdata)
+  attach(DAYCENTdata)
+  experiments<<-TRUE
+}
+
+#Switches
+displayPlots=TRUE
+outputPlots=TRUE
+
+#Put biome and litter type information into useful variables
+Biome <- rep(NA, length(xySITE))
+Biome[xySITE=="ARC"] <- "Tundra"
+Biome[xySITE=="NWT"] <- "Tundra"
+Biome[xySITE=="BNZ"] <- "Boreal"
+Biome[xySITE=="AND"] <- "Conifer"
+Biome[xySITE=="HBR"] <- "Deciduous"
+Biome[xySITE=="HFR"] <- "Deciduous"
+Biome[xySITE=="CWT"] <- "Deciduous"
+Biome[xySITE=="CDR"] <- "Humid"
+Biome[xySITE=="KBS"] <- "Humid"
+Biome[xySITE=="KNZ"] <- "Humid"
+Biome[xySITE=="JRN"] <- "Arid"
+Biome[xySITE=="SEV"] <- "Arid"
+Biome[xySITE=="SGS"] <- "Arid"
+Biome[xySITE=="LUQ"] <- "Tropical"
+
+color <- rep(NA, length(Biome))
+color[Biome == "Tundra"]  <- "darkblue"
+color[Biome == "Boreal"]  <- "black"
+color[Biome == "Conifer"] <- "darkgreen"
+color[Biome == "Deciduous"] <- "yellowgreen"
+color[Biome == "Humid"] <- "darkorange4"
+color[Biome == "Arid"] <- "orange"
+color[Biome == "Tropical"] <- "maroon3"
+
+Litter <- rep(NA, length(xyLIT))
+Litter[xyLIT=="TRAEf"] <- "Triticum aestivum"
+Litter[xyLIT=="PIREf"] <- "Pinus elliottii"
+Litter[xyLIT=="THPLf"] <- "Thuja plicata"
+Litter[xyLIT=="ACSAf"] <- "Acer saccharinum"
+Litter[xyLIT=="QUPRf"] <- "Quercus prinus"
+Litter[xyLIT=="DRGLf"] <- "Drypetes glauca"
+
+color2 <- rep(NA, length(Litter))
+color2[Litter == "Triticum aestivum"]  <- "darkblue"
+color2[Litter == "Pinus elliottii"]  <- "black"
+color2[Litter == "Thuja plicata"] <- "darkgreen"
+color2[Litter == "Acer saccharinum"] <- "yellowgreen"
+color2[Litter == "Quercus prinus"] <- "darkorange4"
+color2[Litter == "Drypetes glauca"] <- "orange"
+
+bnames = as.character(c("Tundra","Boreal","Conifer", "Deciduous","Humid","Arid","Tropical","All"))
+rnames = as.character(c('Biome','r','RMSE', 'bias', 'n'))
+lnames = as.character(c("Triticum aestivum","Pinus elliottii","Thuja plicata","Acer saccharinum","Quercus prinus","Drypetes glauca","All"))
+
+MOD2 <- lm(xyMIMAllN~xyOBSN)
+summary(MOD2)
+Rtext2 <-(paste("r2 = ",signif(summary(MOD2)[[8]], digits=2)))
+print(NSE(sim=xyMIMAllN, obs=xyOBSN))
+
+MOD4 <- lm(xyMIMAllC~xyOBS)
+summary(MOD4)  
+Rtext4 <-(paste("r2 = ",signif(summary(MOD4)[[8]], digits=2)))
+print(NSE(sim=xyMIMAllC, obs=xyOBS))
+
+cor.test(xyMIMAllC,xyOBS)
+cor.test(xyMIMAllN,xyOBSN)
+
+################
+#Output summary statistics
+
+#Tier 2 all pools C vs observed
+mim_table <- array(NA, dim=c(8,5), dimnames=list(bnames,rnames))
+mim_table[,1] <- bnames
+for (i in 1:7) {
+  
+  cor   <- cor.test(xyMIMAllC[Biome==bnames[i]], xyOBS[Biome==bnames[i]])
+  error <- na.omit(xyMIMAllC[Biome==bnames[i]] - xyOBS[Biome==bnames[i]])
+  rmse  <- sqrt(mean(error^2))
+  n     <- length(error)
+  bias  <- sum(error)/n
+  mim_table[i,2] = cor[[4]]
+  mim_table[i,3] = rmse
+  mim_table[i,4] = bias
+  mim_table[i,5] = n  
+  remove(rmse, cor, n, bias, error)
+  
+}
+
+cor   <- cor.test(xyMIMAllC, xyOBS) #repeat w/ all data
+error <- na.omit(xyMIMAllC - xyOBS)
+rmse  <- sqrt(mean(error^2))
+n     <- length(error)
+bias  <- sum(error)/n
+mim_table[8,2] = cor[[4]]
+mim_table[8,3] = rmse
+mim_table[8,4] = bias
+mim_table[8,5] = n  
+remove(rmse, cor, n, bias, error)
+
+fout          <- 'Display_Items/Table_LIDET_MIMICS_SUMMARY_MOD1N_T2AC.csv'
+write.table(mim_table, file=fout, sep=",", col.names=TRUE, row.names=FALSE)
+print(paste("wrote out", fout))
+
+#Tier 2 all pools N vs. observed
+mim_table <- array(NA, dim=c(8,5), dimnames=list(bnames,rnames))
+mim_table[,1] <- bnames
+for (i in 1:7) {
+  
+  cor   <- cor.test(xyMIMAllN[Biome==bnames[i]], xyOBSN[Biome==bnames[i]])
+  error <- na.omit(xyMIMAllN[Biome==bnames[i]] - xyOBSN[Biome==bnames[i]])
+  rmse  <- sqrt(mean(error^2))
+  n     <- length(error)
+  bias  <- sum(error)/n
+  mim_table[i,2] = cor[[4]]
+  mim_table[i,3] = rmse
+  mim_table[i,4] = bias
+  mim_table[i,5] = n  
+  remove(rmse, cor, n, bias, error)
+  
+}
+
+cor   <- cor.test(xyMIMAllN, xyOBSN) #repeat w/ all data
+error <- na.omit(xyMIMAllN - xyOBSN)
+rmse  <- sqrt(mean(error^2))
+n     <- length(error)
+bias  <- sum(error)/n
+mim_table[8,2] = cor[[4]]
+mim_table[8,3] = rmse
+mim_table[8,4] = bias
+mim_table[8,5] = n  
+remove(rmse, cor, n, bias, error)
+
+fout          <- 'Display_Items/Table_LIDET_MIMICS_SUMMARY_MOD1N_T2AN.csv'
+write.table(mim_table, file=fout, sep=",", col.names=TRUE, row.names=FALSE)
+print(paste("wrote out", fout))
+
+#Tier 2 all pools N vs. observed by litter
+mim_table <- array(NA, dim=c(7,5), dimnames=list(lnames,rnames))
+mim_table[,1] <- lnames
+for (i in 1:6) {
+
+  cor   <- cor.test(xyMIMAllN[Litter==lnames[i]], xyOBSN[Litter==lnames[i]])
+  error <- na.omit(xyMIMAllN[Litter==lnames[i]] - xyOBSN[Litter==lnames[i]])
+  rmse  <- sqrt(mean(error^2))
+  n     <- length(error)
+  bias  <- sum(error)/n
+  mim_table[i,2] = cor[[4]]
+  mim_table[i,3] = rmse
+  mim_table[i,4] = bias
+  mim_table[i,5] = n
+  remove(rmse, cor, n, bias, error)
+
+}
+
+cor   <- cor.test(xyMIMAllN, xyOBSN) #repeat w/ all data
+error <- na.omit(xyMIMAllN - xyOBSN)
+rmse  <- sqrt(mean(error^2))
+n     <- length(error)
+bias  <- sum(error)/n
+mim_table[7,2] = cor[[4]]
+mim_table[7,3] = rmse
+mim_table[7,4] = bias
+mim_table[7,5] = n
+remove(rmse, cor, n, bias, error)
+
+fout          <- 'Display_Items/Table_LIDET_MIMICS_SUMMARY_MOD1N_T2AN_litter.csv'
+write.table(mim_table, file=fout, sep=",", col.names=TRUE, row.names=FALSE)
+print(paste("wrote out", fout))
+
+#Tier 2 all pools C vs. observed by litter
+mim_table <- array(NA, dim=c(7,5), dimnames=list(lnames,rnames))
+mim_table[,1] <- lnames
+for (i in 1:6) {
+
+  cor   <- cor.test(xyMIMAllC[Litter==lnames[i]], xyOBS[Litter==lnames[i]])
+  error <- na.omit(xyMIMAllC[Litter==lnames[i]] - xyOBS[Litter==lnames[i]])
+  rmse  <- sqrt(mean(error^2))
+  n     <- length(error)
+  bias  <- sum(error)/n
+  mim_table[i,2] = cor[[4]]
+  mim_table[i,3] = rmse
+  mim_table[i,4] = bias
+  mim_table[i,5] = n
+  remove(rmse, cor, n, bias, error)
+
+}
+
+cor   <- cor.test(xyMIMAllC, xyOBS) #repeat w/ all data
+error <- na.omit(xyMIMAllC - xyOBS)
+rmse  <- sqrt(mean(error^2))
+n     <- length(error)
+bias  <- sum(error)/n
+mim_table[7,2] = cor[[4]]
+mim_table[7,3] = rmse
+mim_table[7,4] = bias
+mim_table[7,5] = n
+remove(rmse, cor, n, bias, error)
+
+fout          <- 'Display_Items/Table_LIDET_MIMICS_SUMMARY_MOD1N_T2AC_litter.csv'
+write.table(mim_table, file=fout, sep=",", col.names=TRUE, row.names=FALSE)
+print(paste("wrote out", fout))
+
+################
+#Figures
+
+if(displayPlots==TRUE){
+
+#Tier 2 all pools C vs observed
+par(mar=c(5,5,1,1), mfrow=c(2,2))
+
+plot(xyMIMAllC,xyOBS, pch=16, col=color2, cex=1.3,
+     cex.lab = 1.4, cex.axis = 1.2, 
+     ylim=c(0,100), xlim=c(0,100),
+     ylab="Observed Mass C remaining (%)",
+     xlab="MIMICS Mass C remaining (%)")
+abline(0,1,lty=2)
+text(97.8,101.5,"1:1")
+text(90, 0, Rtext4)
+legend(-4.5,105,legend=lnames[1:6],
+       col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+       pch=16, cex=.8, bty="n")
+
+plot(xyMIMAllC,xyOBS, pch=16, col=color, cex=1.3,
+     cex.lab = 1.4, cex.axis = 1.2, 
+     ylim=c(0,100), xlim=c(0,100),
+     ylab="Observed Mass C remaining (%)",
+     xlab="MIMICS Mass C remaining (%)")
+abline(0,1,lty=2)
+text(97.8,101.5,"1:1")
+text(90, 0, Rtext4)
+legend(-4.5,105,legend=bnames[1:7], 
+       col=c("darkblue","black","darkgreen", "yellowgreen", 	"darkorange4","orange","maroon3"),
+       pch=16, cex=.8, bty="n")
+
+plot(xyMIMAllN,
+     xyOBSN, pch=16, col=color2, cex=1.3,
+     cex.lab = 1.4, cex.axis = 1.2, 
+     ylim=c(0,2.50), xlim=c(0,2.50),
+     ylab="Observed Fraction of Initial N",
+     xlab="MIMICS Fraction of Initial N")
+abline(0,1,lty=2)
+text(1.45,1.45,"1:1")
+text(1.20, 0, Rtext2)
+legend(0,2.50,legend=lnames[1:6],
+       col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+       pch=16, cex=.8, bty="n")
+
+plot(xyMIMAllN,
+     xyOBSN, pch=16, col=color, cex=1.3,
+     cex.lab = 1.4, cex.axis = 1.2, 
+     ylim=c(0,2.50), xlim=c(0,2.50),
+     ylab="Observed Fraction of Initial N",
+     xlab="MIMICS Fraction of Initial N")
+abline(0,1,lty=2)
+text(1.45,1.45,"1:1")
+text(1.20, 0, Rtext2)
+legend(0,2.50,legend=bnames[1:7], 
+       col=c("darkblue","black","darkgreen", "yellowgreen", 	"darkorange4","orange","maroon3"),
+       pch=16, cex=.8, bty="n")
+
+
+#Plots by litter type
+par(mar=c(5,5,1,1), mfrow=c(3,2))
+for (i in 6:1){
+  plot(xyMIMAllN[Litter==lnames[i]], xyOBSN[Litter==lnames[i]],
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2, 
+       ylim=c(0,2.50), xlim=c(0,2.50),
+       xlab="MIMICS Mass N (% of initial)",
+       ylab="Observed Mass N (% of initial)")
+  abline(0,1,lty=2)
+  text(1.45,1.45,"1:1")
+  text(1.20, 0, lnames[i])
+  legend(0,2.50,legend=bnames[1:7],
+         col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+         pch=16, cex=.8, bty="n")
+}
+
+#Plots by litter type, as in Bonan et al. 2013
+par(mar=c(5,5,1,1), mfrow=c(3,2))
+for (i in 6:1){
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2, 
+       ylim=c(0,250), xlim=c(100,0),
+       ylab="Mass N (% of initial)",
+       xlab="Mass C Remaining (%)")
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.4,col="red")
+  text(85, 5, lnames[i])
+  legend(105,265,legend=bnames[1:7],
+         col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+         pch=16, cex=.8, bty="n")
+}
+
+#Plots by litter type, slightly different color display
+par(mar=c(5,5,1,1), mfrow=c(3,2))
+for (i in 6:1){
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2, 
+       ylim=c(0,250), xlim=c(100,0),
+       ylab="Mass N (% of initial)",
+       xlab="Mass C Remaining (%)")
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=0.8,col=color[Litter==lnames[i]])
+  text(85, 5, lnames[i])
+  legend(105,265,legend=bnames[1:7],
+         col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+         pch=16, cex=.8, bty="n")
+}
+}
+
+
+
+if(outputPlots==TRUE){
+# Write out N plots
+
+fout          <- c('Display_Items/PredvsObsN.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=15, height=7)
+
+ par(mar=c(5,5,1,1), mfrow=c(1,2))
+plot(xyMIMAllN,
+     xyOBSN, pch=16, col=color2, cex=1.3,
+     cex.lab = 1.8, cex.axis = 1.6,
+     ylim=c(0,2.50), xlim=c(0,2.50),
+     ylab="Observed Fraction of Initial N",
+     xlab="MIMICS Fraction of Initial N")
+abline(0,1,lty=2)
+text(2.2,2.2,"1:1")
+text(1.50, 0, Rtext2)
+legend(0,2.50,legend=lnames[1:6],
+       col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+       pch=16, cex=1.2, bty="n")
+
+plot(xyMIMAllN,
+     xyOBSN, pch=16, col=color, cex=1.3,
+     cex.lab = 1.8, cex.axis = 1.6,
+     ylim=c(0,2.50), xlim=c(0,2.50),
+     ylab="Observed Fraction of Initial N",
+     xlab="MIMICS Fraction of Initial N")
+abline(0,1,lty=2)
+text(2.2,2.2,"1:1")
+text(1.50, 0, Rtext2)
+legend(0,2.50,legend=bnames[1:7],
+       col=c("darkblue","black","darkgreen", "yellowgreen",     "darkorange4","orange","maroon3"),
+       pch=16, cex=1.2, bty="n")   
+dev.off()
+
+fout          <- c('Display_Items/PredvsObsN by litter.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=8, height=8)    
+    
+par(mar=c(5,5,1,1), mfrow=c(3,2))
+for (i in 6:1){
+  plot(xyMIMAllN[Litter==lnames[i]], xyOBSN[Litter==lnames[i]],
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,2.50), xlim=c(0,2.50),
+       xlab="MIMICS Mass N (% of initial)",
+       ylab="Observed Mass N (% of initial)")
+  abline(0,1,lty=2)
+  text(2.2,2.2,"1:1")
+  text(.20, 0, lnames[i])
+  legend(0,2.50,legend=bnames[1:7],
+         col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+         pch=16, cex=.8, bty="n")
+}
+dev.off()
+
+fout          <- c('Display_Items/CvN red.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=8, height=8)    
+    
+par(mar=c(5,5,0,0), mfrow=c(3,2))
+par(oma = c(0,0,1,1))
+panelLabels=c("(f)","(e)","(d)","(c)","(b)","(a)")
+litCN=c(133,93, 83, 63, 53, 24)
+
+  i=6
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+       ylab="Mass N (% of initial)",
+      xlab="", 
+      xaxt='n')
+      text(95,225,panelLabels[i], cex=2)
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.8,col="red")
+  text(75, 5, labels=paste(lnames[i],", C/N = ",litCN[i]), font=3)
+
+  i=5
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+      ylab="", 
+      yaxt='n',
+      xlab="", 
+      xaxt='n')
+       text(95,225,panelLabels[i], cex=2)
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.8,col="red")
+  text(75, 5, labels=paste(lnames[i],", C/N = ",litCN[i]), font=3)
+    legend(30,265,legend=bnames[1:7],
+         col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+         pch=16, cex=1.4, bty="n")
+  
+  i=4
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+       ylab="Mass N (% of initial)",
+    xlab="", 
+    xaxt='n')
+       text(95,225,panelLabels[i], cex=2)
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.8,col="red")
+  text(75, 5, labels=paste(lnames[i],", C/N = ",litCN[i]), font=3)
+
+  i=3
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+      ylab="", 
+      yaxt='n',
+    xlab="", 
+    xaxt='n')
+       text(95, 225,panelLabels[i], cex=2)
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.8,col="red")
+  text(75, 5, labels=paste(lnames[i],", C/N = ",litCN[i]), font=3)
+
+  i=2
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+       ylab="Mass N (% of initial)",
+       xlab="Mass C Remaining (%)")
+       text(95,225,panelLabels[i], cex=2)
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.8,col="red")
+  text(75, 5, labels=paste(lnames[i],", C/N = ",litCN[i]), font=3)
+
+  i=1
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+      ylab="", 
+      yaxt='n',
+       xlab="Mass C Remaining (%)")
+       text(95,225,panelLabels[i], cex=2)
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=.8,col="red")
+  text(75, 5, labels=paste(lnames[i],", C/N = ",litCN[i]), font=3)
+  
+dev.off()
+
+
+fout          <- c('Display_Items/CvN colored.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=8, height=8)    
+    
+par(mar=c(5,5,1,1), mfrow=c(3,2))
+for (i in 6:1){
+  plot(xyOBS[Litter==lnames[i]], xyOBSN[Litter==lnames[i]]*100,
+       pch=16, col=color[Litter==lnames[i]], cex=1.3,
+       cex.lab = 1.4, cex.axis = 1.2,
+       ylim=c(0,250), xlim=c(100,0),
+       ylab="Mass N (% of initial)",
+       xlab="Mass C Remaining (%)")
+  points(xyMIMAllC[Litter==lnames[i]], xyMIMAllN[Litter==lnames[i]]*100,
+         pch=2,cex=0.8,col=color[Litter==lnames[i]])
+  text(85, 5, lnames[i])
+  legend(95,265,legend=bnames[1:7],
+         col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+         pch=16, cex=.8, bty="n")
+}
+dev.off()
+
+
+fout          <- c('Display_Items/PredvsObsAllC.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=15, height=7)
+
+par(mar=c(5,5,1,1), mfrow=c(1,2))
+plot(xyMIMAllC/100,
+xyOBS/100, pch=16, col=color2, cex=1.3,
+cex.lab = 1.8, cex.axis = 1.6,
+ylim=c(0,1.0), xlim=c(0,1.0),
+ylab="Observed Fraction of Initial C",
+xlab="MIMICS Fraction of Initial C")
+abline(0,1,lty=2)
+text(0.8,0.8,"1:1")
+text(.90, 0, Rtext4)
+legend(0,1,legend=lnames[1:6],
+col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+pch=16, cex=1.2, bty="n")
+
+plot(xyMIMAllC/100,
+xyOBS/100, pch=16, col=color, cex=1.3,
+cex.lab = 1.8, cex.axis = 1.6,
+ylim=c(0,1.0), xlim=c(0,1.0),
+ylab="Observed Fraction of Initial C",
+xlab="MIMICS Fraction of Initial C")
+abline(0,1,lty=2)
+text(.8,.8,"1:1")
+text(.90, 0, Rtext4)
+legend(0,1,legend=bnames[1:7],
+col=c("darkblue","black","darkgreen", "yellowgreen",     "darkorange4","orange","maroon3"),
+pch=16, cex=1.2, bty="n")
+
+dev.off()
+
+
+fout          <- c('Display_Items/PredvsObs4panel.pdf')
+fout          <- paste(fout, collapse="")
+pdf(fout, width=15, height=15)
+
+ par(mar=c(5,5,1,1), mfrow=c(2,2))
+
+ plot(xyMIMAllC/100,
+    xyOBS/100, pch=16, col=color2, cex=1.6,
+    cex.lab = 1.8, cex.axis = 1.6,
+    ylim=c(0,1.0), xlim=c(0,1.0),
+    ylab="Observed Fraction of Initial C",
+    xlab="MIMICS Fraction of Initial C")
+    abline(0,1,lty=2)
+    text(0.9,1,"(a)", cex=2)
+    text(0.97,1,"1:1")
+    text(.85, 0, Rtext4, cex=2)
+    legend(0,1,legend=lnames[1:6], text.font=3,
+    col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+    pch=16, cex=1.7, bty="n")
+
+  plot(xyMIMAllC/100,
+    xyOBS/100, pch=16, col=color, cex=1.6,
+    cex.lab = 1.8, cex.axis = 1.6,
+    ylim=c(0,1.0), xlim=c(0,1.0),
+    ylab="", 
+    yaxt='n',
+    xlab="MIMICS Fraction of Initial C")
+    abline(0,1,lty=2)
+    text(0.9,1,"(b)", cex=2)
+    text(.97,1,"1:1")
+    text(.85, 0, Rtext4, cex=2)
+    legend(0,1,legend=bnames[1:7],
+    col=c("darkblue","black","darkgreen", "yellowgreen",     "darkorange4","orange","maroon3"),
+    pch=16, cex=1.7, bty="n")
+     
+  plot(xyMIMAllN,
+     xyOBSN, pch=16, col=color2, cex=1.6,
+     cex.lab = 1.8, cex.axis = 1.6,
+     ylim=c(0,2.50), xlim=c(0,2.50),
+     ylab="Observed Fraction of Initial N",
+     xlab="MIMICS Fraction of Initial N")
+     abline(0,1,lty=2)
+     text(2.25,2.5,"(c)", cex=2)
+     text(2.4,2.5,"1:1")
+     text(2.20, 0, Rtext2, cex=2)
+     legend(0,2.50,legend=lnames[1:6],text.font=3,
+     col=c("darkblue","black","darkgreen", "yellowgreen",   "darkorange4","orange","maroon3"),
+     pch=16, cex=1.7, bty="n")
+
+  plot(xyMIMAllN,
+     xyOBSN, pch=16, col=color, cex=1.6,
+     cex.lab = 1.8, cex.axis = 1.6,
+     ylim=c(0,2.50), xlim=c(0,2.50),
+     ylab="", 
+     yaxt='n',
+     xlab="MIMICS Fraction of Initial N")
+     abline(0,1,lty=2)
+     text(2.25,2.5,"(d)", cex=2)
+     text(2.4,2.5,"1:1")
+     text(2.20, 0, Rtext2, cex=2)
+     legend(0,2.50,legend=bnames[1:7],
+     col=c("darkblue","black","darkgreen", "yellowgreen",     "darkorange4","orange","maroon3"),
+     pch=16, cex=1.7, bty="n")   
+
+dev.off()
+}
+}
+```
+
+
+## Executable LIDET site loop - runs just for HFR
+```{r}
+for (s in 6){
+  #Find steady state solution, plot to examine and output values to table
+  readLIDETObservations() 
+  siteSpecificParameters()
+  initializePools()
+  findSteadyState()
+  if(SSPlots==TRUE){
+    plotSteadyState()
+  }
+  outputSteadyState()
+  histogramOutput()
+  
+  #Litterbag addition experiments
+  if(experiments==TRUE){
+    initializeTracerPools()
+    runLitterbags()
+    outputLitterbags()
+    plotLitterbags()
+    niceLitterbagPlot()
+  }
+} #finish site loop
+
+#output steady state data to table
+data_out <<- SSoutput
+fout <<- 'MIMICS_SSoutput.csv'
+write.table(data_out, file=fout, sep=",", col.names=TRUE, row.names=FALSE)
+plotHistograms()
+```
